@@ -1,0 +1,50 @@
+experiment_name: smoke
+output_dir: results/smoke
+
+seeds: [1]
+methods:
+  - local_only
+  - random_peer
+  - pearl_full
+
+seed: 1
+dataset: fashion_mnist
+data_dir: data
+download: true
+num_clients: 5
+partition: dirichlet
+dirichlet_alpha: 0.5
+classes_per_client: 2
+min_client_size: 2
+train_subset: 1000
+test_subset: 300
+
+graph_type: erdos_renyi
+er_prob: 0.6
+
+rounds: 2
+local_epochs: 1
+batch_size: 64
+lr: 1.0e-3
+num_workers: 0
+pin_memory: false
+device: auto
+
+latent_dim: 64
+lambda_rec: 1.0
+lambda_cls: 1.0
+
+mixing_alpha: 0.3
+exchange_mode: encoder_decoder_local_head
+selection_method: pearl_full
+
+beta_proto: 1.0
+beta_quality: 1.0
+beta_cost: 0.1
+beta_explore: 0.2
+
+anchor_size: 16
+hard_class_threshold: 0.5
+explore_window: 5
+eval_every: 1
+plot_format: pdf
