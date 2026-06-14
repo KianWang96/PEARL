@@ -1,0 +1,49 @@
+experiment_name: paper_ring150
+output_dir: results/paper_ring150
+seeds: [1, 2, 3]
+methods:
+  - local_only
+  - random_peer
+  - static_peer
+  - prototype_only
+  - quality_only
+  - prototype_quality
+  - prototype_quality_exploration
+  - anchor_quality
+  - hard_class_alignment
+  - pearl_full
+seed: 1
+dataset: fashion_mnist
+data_dir: data
+download: true
+num_clients: 50
+partition: dirichlet
+dirichlet_alpha: 0.3
+classes_per_client: 2
+min_client_size: 10
+train_subset: null
+test_subset: null
+graph_type: ring
+er_prob: 0.15
+rounds: 150
+local_epochs: 1
+batch_size: 64
+lr: 1.0e-3
+num_workers: 2
+pin_memory: true
+device: auto
+latent_dim: 64
+lambda_rec: 1.0
+lambda_cls: 1.0
+mixing_alpha: 0.3
+exchange_mode: encoder_decoder_local_head
+selection_method: pearl_full
+beta_proto: 1.0
+beta_quality: 1.0
+beta_cost: 0.1
+beta_explore: 0.2
+anchor_size: 64
+hard_class_threshold: 0.5
+explore_window: 10
+eval_every: 1
+plot_format: pdf
