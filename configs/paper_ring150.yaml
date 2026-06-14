@@ -1,5 +1,6 @@
 experiment_name: paper_ring150
 output_dir: results/paper_ring150
+
 seeds: [1, 2, 3]
 methods:
   - local_only
@@ -16,6 +17,7 @@ seed: 1
 dataset: fashion_mnist
 data_dir: data
 download: true
+
 num_clients: 50
 partition: dirichlet
 dirichlet_alpha: 0.3
@@ -23,8 +25,10 @@ classes_per_client: 2
 min_client_size: 10
 train_subset: null
 test_subset: null
+
 graph_type: ring
 er_prob: 0.15
+
 rounds: 150
 local_epochs: 1
 batch_size: 64
@@ -36,6 +40,7 @@ latent_dim: 64
 lambda_rec: 1.0
 lambda_cls: 1.0
 mixing_alpha: 0.3
+
 exchange_mode: encoder_decoder_local_head
 selection_method: pearl_full
 beta_proto: 1.0
