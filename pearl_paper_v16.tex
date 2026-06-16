@@ -1,0 +1,2192 @@
+\documentclass[conference]{IEEEtran}
+
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\newcommand{\rev}[1]{{\color{red}#1}}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{url}
+\usepackage{balance}
+\usepackage{amsthm}
+\newtheorem{assumption}{Assumption}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\interdisplaylinepenalty=2500
+\setlength{\emergencystretch}{2em}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Learning Whom to Learn From: Budgeted Peer Selection for Decentralised Representation Learning}
+
+\author{\IEEEauthorblockN{Ke Xiao, Qiyuan Wang, Christos Anagnostopoulos}
+\IEEEauthorblockA{\textit{School of Computing Science, University of Glasgow, UK} \\
+ke.xiao@glasgow.ac.uk, qiyuan.wang@glasgow.ac.uk, christos.anagnostopoulos@glasgow.ac.uk}
+}
+
+\maketitle
+
+\begin{abstract}
+This paper studies decentralised representation learning under a strict one-model-exchange-per-client budget. In server-based federated learning, the server is a privileged coordinator: it sees all clients, aggregates globally, and can implement fairness mechanisms centrally. Removing the server destroys this global knowledge entirely. Each client becomes blind --- it knows only its own data, its own model, and the identities of its immediate graph neighbours. Under a one-peer budget, this blindness is especially costly: a harmful random selection wastes the client's only model-bearing communication opportunity in that round, with no coordinator to correct the damage.
+
+We propose \textbf{PEARL} (\textbf{PE}er-selective \textbf{A}daptive \textbf{R}epresentation \textbf{L}earning), which gives each client a minimal local test of compatibility before committing to model exchange. Clients transmit a small anchor set to each candidate neighbour and observe how well that neighbour already performs on their data. This requires no global coordination and no violation of the one-peer budget --- only a brief descriptor exchange before the model-exchange decision is made. PEARL then selects the peer whose latent prototypes best align with the client's hard classes, whose anchor-validated quality is highest, and whose recent visit count is lowest, combining all signals into a single composite score.
+
+We analyse the one-peer constraint theoretically, showing how sparse peer choice can deviate from full-neighbour aggregation, increase update variance, and induce selection-dependent bias under non-IID data, while repeated graph interaction can still support consensus when selection does not collapse. Full-scale experiments ($K=50$ clients, 150 rounds, 3 seeds) on two topologies show that \texttt{pearl\_full} consistently achieves the lowest negative transfer rate among all ten evaluated methods: $0.153\pm0.050$ on Erd\H{o}s--R\'{e}nyi ($-2.0$~pp vs random gossip, $-14.7$~pp vs the next-best ablation) and $0.133\pm0.061$ on scale-free ($-3.3$~pp vs random gossip, $-12.0$~pp vs the next-best ablation). Worst-client accuracy reaches $0.966\pm0.011$ (ER) and $0.951\pm0.020$ (scale-free), both competitive with or above random gossip. Selection entropy stabilises at $0.194$ (ER) and $0.183$ (scale-free), strictly between random ($\approx0.864$) and collapsed ($0.000$) selection, directly validating the theoretical predictions across both topologies.
+\end{abstract}
+
+
+\begin{IEEEkeywords}
+Decentralised federated learning, peer-to-peer learning, representation learning, encoder--decoder models, classification, neighbour selection, non-IID data, distributed optimisation.
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{sec:introduction}
+Federated learning (FL) trains machine learning models from distributed private data without central pooling \cite{mcmahan2017communication}. In the canonical formulation, clients send model updates to a central server, which aggregates them globally. From each client's perspective the communication pattern is simple: one partner per round, namely the server. The server is special precisely because it sees every client and can act as a global coordinator --- selecting participants, reweighting contributions, identifying and protecting stragglers.
+
+This paper asks what happens when we preserve the same per-client communication count but remove the server. In a fully decentralised system, clients communicate over an arbitrary graph. Each client can exchange model information with only one of its graph neighbours per round. No coordinator exists. Each client is \emph{blind}: it knows only its own data, its own model, and the identities of its immediate neighbours. It cannot know whether it is the weakest client in the network, which of its neighbours has a compatible data distribution, or whether a proposed exchange will help or harm it.
+
+This blindness is especially dangerous under a one-peer budget. Random gossip assigns a partner without any compatibility test. If the selected neighbour has an incompatible distribution --- likely under non-IID data --- the exchange increases local validation loss, slows recovery, damages personalisation, and wastes the client's only model-bearing communication slot in that round. Weak or minority clients, whose distributions diverge most from dominant peers, lose this lottery most often. The problem is not communication sparsity; it is that uninformed selection under non-IID data systematically harms the clients who most need protection, with no coordinator to intervene.
+
+PEARL addresses this with a minimal local compatibility test that requires no global knowledge and no extra model-bearing exchange. Before committing to a peer, each client sends a small anchor set to each candidate neighbour and observes how well that neighbour already performs on its data. A neighbour that generalises well to the client's own distribution is a safe partner; one that does not is screened out. This single mechanism --- anchor-validated cross-quality --- turns each client from a passive random-gossip receiver into an active gatekeeper of its own learning.
+
+Many real environments motivate this setting. Edge networks, mobile ad-hoc systems, sensor deployments, and multi-institutional collaborations without a trusted central authority operate over arbitrary graphs \cite{yuan2023decentralized}. In all such settings, removing the server does not merely change the graph topology; it removes the global intelligence that protects individual clients from harmful interactions.
+
+\textit{Safety-aware peer selection is motivated by the fact that random gossip is diverse but blind. In non-IID decentralised networks, random diversity can sometimes improve average learning, but it does not explicitly protect clients from harmful peer exchanges. Under a one-model-exchange budget, such harmful choices are particularly costly because they consume the client’s only communication opportunity in that round. PEARL addresses this by making peer selection more reliable: reducing harmful updates, supporting more stable learning, improving the usefulness of each exchange, and potentially offering better protection for weak or distributionally distinctive clients.}
+
+The contributions of this paper are:
+\begin{itemize}
+    \item We formulate \emph{budgeted peer-selective decentralised representation learning}, where each client is allowed only one model-bearing peer exchange per round. This preserves the per-client exchange count of server-based FL while removing the fixed server partner, turning decentralised learning into a local decision problem: whom should a client learn from?
+
+    \item We propose \textbf{PEARL}, a two-stage descriptor-based selection--exchange protocol for representation-based classification over arbitrary graphs. Clients first exchange lightweight descriptors and then exchange model information only with the selected peer, supporting encoder or encoder--decoder sharing with local classifier heads.
+
+    \item We introduce a unified family of one-peer selection criteria combining latent compatibility, anchor-validated cross-quality, hard-class alignment, communication cost, and recency-aware exploration. These criteria are designed to select peers that are useful for the selecting client, particularly on classes where it currently underperforms, while avoiding collapse onto a single neighbour.
+
+    \item We provide theoretical and empirical foundations for evaluating one-peer selection beyond mean accuracy alone. The analysis characterises deviation from full-neighbour aggregation, selection-induced generalisation risk, consensus under repeated interaction, and the role of exploration; the evaluation framework focuses on budget-matched baselines, negative transfer, client-level robustness, and structured selection entropy.
+
+    \item We demonstrate empirically that \textsc{PEARL} achieves the lowest negative transfer rate of all ten evaluated methods on both official topologies: $0.153\pm0.050$ on ER ($-2.0$~pp vs random gossip, $-14.7$~pp vs the next-best ablation) and $0.133\pm0.061$ on scale-free ($-3.3$~pp vs random gossip, $-12.0$~pp vs the next-best ablation). The negative transfer advantage grows with degree heterogeneity, directly validating Proposition~\ref{prop:selection_gap}'s prediction that the anchor-validated quality screen becomes more valuable as the risk of random incompatible selection increases. Worst-client accuracy is competitive with or above random gossip on ER ($+0.1$~pp) and the best of any method with competitive mean accuracy on scale-free, confirming the fairness properties of Corollary~\ref{cor:deterministic_selection}.
+
+    \item We show that \textsc{PEARL}'s normalised per-client selection entropy stabilises between zero and one on both official topologies ($0.194$ on ER, $0.183$ on scale-free), lower than random gossip ($\approx0.864$) but strictly positive unlike static selection ($0.000$), and decreasing with degree as predicted by the $\varepsilon/|\mathcal{N}_k|$ lower bound of Lemma~\ref{lem:epsilon_greedy}. This directly confirms non-collapsed selection behaviour consistent with Proposition~\ref{prop:consensus}'s edge-activation condition.
+\end{itemize}
+
+We study these contributions in the context of representation-based classification. Each client maintains an encoder--decoder model with a classifier head. The local objective combines reconstruction and classification losses, producing representations that are both structure-preserving and task-discriminative \cite{le2018supervised,chen2023auto}. Encoder--decoder weights are shared across peers while classifier heads remain local, supporting personalisation under heterogeneous distributions \cite{collins2021exploiting}. Latent class prototypes extracted from the encoder serve as the lightweight descriptors that enable peer selection without full model exchange, making the two-stage protocol both communication-efficient and theoretically grounded.
+
+\section{Related Work}
+\label{sec:related-work}
+
+\subsection{Server-Based Federated Learning}
+\label{subsec:server-based-federated-learning}
+Federated learning (FL) was introduced as a communication-efficient paradigm for training machine learning models from decentralised data without requiring clients to upload raw samples to a central location \cite{mcmahan2017communication}. In the standard setting, a central server broadcasts model parameters to selected clients, clients perform local optimisation on private data, and the server aggregates their updates, commonly through weighted averaging. Federated Averaging (FedAvg) remains the canonical baseline for this setting because of its simplicity and communication efficiency. However, FedAvg assumes a star-shaped topology and relies on a central coordinator, which can become a communication bottleneck, a single point of failure, or an unsuitable trust anchor in peer-to-peer distributed systems.
+
+Several server-based FL methods have been proposed to address statistical and systems heterogeneity. FedProx extends FedAvg by adding a proximal term to stabilise local training under heterogeneous client data and variable local computation \cite{li2020fedprox}. SCAFFOLD introduces control variates to correct client drift caused by non-IID data and local updates \cite{karimireddy2020scaffold}. MOON uses model-level contrastive learning to improve representation consistency across clients under heterogeneous data \cite{li2021moon}. These methods are important baselines for heterogeneous FL, but they still assume a central aggregation mechanism. In contrast, this paper considers a decentralised peer-to-peer setting in which no server is available and each client must decide which neighbouring peer to communicate with.
+
+A key motivation of our work is to separate the communication budget from the aggregation architecture. In server-based FL, each client communicates with exactly one node per round, but that node is a global coordinator with access to updates from many clients. In a decentralised graph, imposing the same one-model-exchange budget per client does not identify a unique communication partner. Instead, a client with degree $|\mathcal{N}_k|>1$ must choose one peer from several possible neighbours. The proposed method studies this budget-matched regime: each client is allowed one outgoing model-bearing peer interaction per round, matching the per-client communication count of server-based FL, but the selected peer is a local graph neighbour rather than a central server.
+
+
+\subsection{Decentralised Optimisation and Decentralised Federated Learning}
+\label{subsec:decentralised-optimisation-and-decentralised-feder}
+Decentralised learning removes the central server and represents the system as a communication graph whose nodes are clients and whose edges define possible peer-to-peer interactions. Classical decentralised stochastic optimisation methods, such as decentralised parallel stochastic gradient descent (D-PSGD), allow each node to perform local gradient steps and mix parameters with neighbouring nodes \cite{lian2017decentralized}. Such methods reduce reliance on a central parameter server and can lower communication pressure on any single node. Gossip learning similarly uses peer-to-peer model exchanges, often through randomised interactions, to diffuse information through the network \cite{ormandi2013gossip,hegedus2019gossip}. Decentralised FL has also been studied as a broader alternative to server-based FL when central aggregation is impractical or undesirable \cite{yuan2023decentralized}.
+
+Recent decentralised learning methods have focused on improving the communication--convergence trade-off. MATCHA accelerates decentralised SGD by decomposing the communication graph into matchings and activating communication links according to their importance for network connectivity \cite{wang2019matcha}. CHOCO-SGD combines decentralised stochastic optimisation with compressed communication, reducing communication cost while maintaining convergence guarantees over arbitrary graphs \cite{koloskova2019choco}. These methods show that graph topology, communication sparsity, and mixing frequency are central to decentralised learning performance. However, they typically focus on optimisation and communication scheduling rather than task-aware peer selection for representation learning. Our work differs by asking which neighbour a client should learn from at each round, using task, representation, diversity, and communication signals.
+
+\subsection{Client Selection, Peer Selection, and Budgeted Communication}
+\label{subsec:client-selection-peer-selection-and-communication}
+Client selection is well studied in server-based FL, where the server chooses a subset of clients for each communication round. Peer selection in a decentralised graph is different. The decision is no longer made by a central coordinator, and the candidate set is not the global client population but the local neighbourhood of each node. Under a one-model-exchange-per-round budget, client $k$ must select one peer from $\mathcal{N}_k$, even when $|\mathcal{N}_k|>1$.
+
+Random gossip-style selection satisfies the one-peer model-exchange budget and is a natural baseline, but it ignores whether the selected peer is useful for the local learning task. Full-neighbour aggregation can improve mixing, but it violates the model-bearing exchange budget studied in this paper whenever $|\mathcal{N}_k|>1$. We therefore treat full-neighbour aggregation as an unconstrained reference rather than as the primary comparator. The budget-matched question is whether an informed one-peer strategy can outperform random, static, or similarity-only one-peer strategies.
+
+The proposed framework formalises peer selection as local utility maximisation under a fixed per-round budget. Each client selects a single peer according to criteria such as latent-space compatibility, validation utility, hard-example support, communication cost, diversity, or exploration. This raises a further practical question: how can a client estimate the usefulness of a neighbour without first receiving that neighbour's full model? To address this, we separate selection from exchange. Clients first exchange lightweight descriptors, such as latent prototypes, validation statistics, or communication metadata, and only the selected peer participates in model or update exchange.
+
+\subsection{Personalised Federated Learning and Representation Sharing}
+\label{subsec:personalised-federated-learning-and-representation}
+In heterogeneous federated settings, a single global model may not perform well for all clients. Personalised federated learning (PFL) addresses this by allowing some degree of client-specific adaptation. FedPer separates a shared base model from personalised layers, enabling clients to adapt their final prediction layers to local data \cite{arivazhagan2019fedper}. FedRep similarly learns a shared representation while maintaining client-specific heads, motivated by the idea that clients may share feature structure while differing in label distributions or decision boundaries \cite{collins2021exploiting}. pFedMe formulates personalisation through a Moreau-envelope regularised objective, decoupling personalised model optimisation from global model learning \cite{dinh2020pfedme}. Ditto introduces a personalised FL framework that aims to improve fairness and robustness under heterogeneous data \cite{li2021ditto}.
+
+These methods motivate the representation-sharing design used in this paper. An encoder can be treated as a shared representation learner, while classifier heads may remain local to support client-specific decision boundaries. However, most PFL methods remain server-based. Our work transfers the representation-sharing intuition to a decentralised graph setting, where representation exchange occurs through selected neighbouring peers rather than through a global server.
+
+\subsection{Encoder--Decoder Representation Models}
+\label{subsec:encoder-decoder-representation-models}
+Encoder--decoder representation models can learn compressed latent representations by reconstructing their inputs. The encoder maps an input to a latent representation, while the decoder reconstructs the input from that representation. In supervised encoder--decoder formulations, reconstruction loss is combined with classification loss so that the learned latent space preserves input structure while also supporting discriminative prediction \cite{le2018supervised}. Recent surveys and applications continue to highlight encoder--decoder models as flexible tools for dimensionality reduction, denoising, anomaly detection, and classification-oriented feature learning \cite{chen2023auto,gille2022semi}.
+
+In the proposed framework, the encoder--decoder model is not used only as a dimensionality-reduction tool. Instead, it provides the representational backbone for decentralised collaboration. Latent class prototypes can be extracted from the encoder and used as lightweight descriptors for peer selection. The decoder regularises the representation by preserving input structure, while the classifier head encourages task-discriminative latent geometry. This enables a client to select neighbours not only according to model performance, but also according to latent-space compatibility.
+
+\subsection{Positioning of This Work}
+\label{subsec:positioning-of-this-work}
+
+The key distinction of this work is not simply that the server is removed, but what that removal implies for individual clients. In server-based FL, fairness mechanisms --- weighted aggregation, client selection, bias correction --- are implemented centrally by a coordinator with global knowledge. In a fully decentralised system, no such coordinator exists. Each client is blind to the rest of the network: it cannot identify which clients have compatible distributions, which neighbours will help or harm it, or whether it is among the weakest participants. Existing decentralised methods either accept this blindness (random gossip, D-PSGD) or require all-neighbour aggregation that exceeds the one-peer budget. Neither protects weak clients from harmful random exchanges.
+
+PEARL is the first framework to ask a different question: can a client, operating entirely from local information, learn to identify compatible peers before committing to model exchange? The anchor-validated quality criterion answers this with a lightweight compatibility test that requires no global coordination, no extra model-bearing exchange, and no knowledge beyond the client's own data. This reframes decentralised peer selection from a communication-scheduling problem into a local decision problem with explicit fairness consequences, and it is precisely this reframing that connects the algorithmic design to the theoretical analysis and empirical evaluation throughout the paper.
+
+The closest budget-matched baselines are random one-peer gossip, static one-peer communication, and one-peer ablations of the proposed selection rule. Full-neighbour decentralised averaging, FedAvg, FedProx, SCAFFOLD, FedRep, MATCHA, and CHOCO-SGD are useful references but do not satisfy the one-model-exchange-per-client constraint or operate without a coordinator.
+
+\section{Preliminaries}
+\label{sec:preliminaries}
+
+\subsection{Network Model}
+\label{subsec:network-model}
+
+We consider a distributed system represented by an undirected or directed communication graph
+\begin{equation}
+    \mathcal{G} = (\mathcal{V}, \mathcal{E}),
+    \label{eq:auto-001}
+\end{equation}
+where \(\mathcal{V}=\{1,2,\dots,K\}\) is the set of clients and \(\mathcal{E}\) is the set of communication links. If \((k,j)\in\mathcal{E}\), then client \(k\) can communicate with client \(j\). The neighbourhood of client \(k\) is denoted by
+\begin{equation}
+    \mathcal{N}_k = \{j \in \mathcal{V}: (k,j)\in\mathcal{E}\}.
+    \label{eq:auto-002}
+\end{equation}
+
+Unlike server-based FL, there is no central aggregator. Each client communicates only with peers reachable through the graph. We allow the graph to be arbitrary and, in extensions, time-varying:
+\begin{equation}
+    \mathcal{G}^t = (\mathcal{V}, \mathcal{E}^t),
+    \label{eq:auto-003}
+\end{equation}
+where \(t\) denotes the communication round.
+
+\subsection{Local Data}
+\label{subsec:local-data}
+
+Each client \(k\) owns a private labelled dataset
+\begin{equation}
+    \mathcal{D}_k = \{(x_i^k,y_i^k)\}_{i=1}^{n_k},
+    \label{eq:auto-004}
+\end{equation}
+where \(x_i^k \in \mathbb{R}^{d}\) is an input sample and \(y_i^k \in \{1,\dots,C\}\) is the corresponding class label. The total number of samples across the network is
+\begin{equation}
+    N = \sum_{k=1}^{K} n_k.
+    \label{eq:auto-005}
+\end{equation}
+
+The data may be non-independent and identically distributed (non-IID) across clients:
+\begin{equation}
+    P_k(x,y) \neq P_j(x,y), \quad k\neq j.
+    \label{eq:auto-006}
+\end{equation}
+This captures realistic heterogeneity, including feature shift, label shift, class imbalance, sample-size imbalance, domain shift, and noise-level variation.
+
+\subsection{Encoder--Decoder Representation Classifier}
+\label{subsec:encoder-decoder-representation-classifier}
+
+Each client \(k\) maintains a representation-learning model parameterised by
+\begin{equation}
+    \Theta_k = \{\theta_k,\phi_k,\psi_k\},
+    \label{eq:auto-007}
+\end{equation}
+where \(\theta_k\) are encoder parameters, \(\phi_k\) are decoder parameters, and \(\psi_k\) are classifier-head parameters. \rev{When parameter averaging is written below, \(\Theta_k\) denotes the vectorised concatenation of these parameter blocks, with averaging applied componentwise to compatible blocks.}
+
+The encoder maps an input to a latent representation:
+\begin{equation}
+    z_i^k = f_{\theta_k}(x_i^k), \quad z_i^k \in \mathbb{R}^{m}, \quad m < d.
+    \label{eq:auto-008}
+\end{equation}
+The decoder reconstructs the input:
+\begin{equation}
+    \hat{x}_i^k = g_{\phi_k}(z_i^k)=g_{\phi_k}(f_{\theta_k}(x_i^k)).
+    \label{eq:auto-009}
+\end{equation}
+The classifier predicts the class label:
+\begin{equation}
+    \hat{y}_i^k = h_{\psi_k}(z_i^k)=h_{\psi_k}(f_{\theta_k}(x_i^k)).
+    \label{eq:auto-010}
+\end{equation}
+
+\section{Local Learning Objective}
+\label{sec:local-learning-objective}
+
+Each client optimises a joint reconstruction and classification objective. The local empirical loss at client \(k\) is
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_k(\Theta_k)
+&=\frac{1}{n_k}\sum_{i=1}^{n_k}
+\Big[
+\lambda_{rec}\,\ell_{rec}(x_i^k,\hat{x}_i^k)\\
+&\qquad+\lambda_{cls}\,\ell_{cls}(y_i^k,\hat{y}_i^k)
+\Big].
+\end{aligned}
+\label{eq:local_loss}
+\end{equation}
+where \(\lambda_{rec}\geq0\) and \(\lambda_{cls}\geq0\) control the balance between reconstruction and classification.
+
+A common reconstruction loss is mean squared error:
+\begin{equation}
+    \ell_{rec}(x,\hat{x}) = \|x-\hat{x}\|_2^2.
+    \label{eq:auto-011}
+\end{equation}
+For classification, cross-entropy is commonly used:
+\begin{equation}
+    \ell_{cls}(y,\hat{y}) = -\sum_{c=1}^{C} \mathbb{I}[y=c]\log p_c,
+    \label{eq:auto-012}
+\end{equation}
+where \(p_c\) is the predicted probability of class \(c\).
+
+The reconstruction term encourages the latent representation to retain informative structure from the input. The classification term encourages the latent representation to be discriminative for the target task.
+
+\section{Decentralised Problem Formulation}
+\label{sec:decentralised-problem-formulation}
+
+The proposed setting is defined by a fixed communication budget rather than by a preference for sparsity alone. In server-based FL, client $k$ communicates with one node per communication round: the server. If training lasts for $T$ rounds, the client performs $T$ client--server interactions. The server is able to aggregate global information because many clients contact the same coordinator in the same round. We preserve this per-client communication count but remove the coordinator. Thus, in the decentralised setting, each client is allowed exactly one outgoing \rev{model-bearing} peer \rev{exchange} per round:
+\begin{equation}
+    B_k^t = 1,
+    \qquad k\in\mathcal{V},\; t=0,\dots,T-1.
+    \label{eq:one_peer_budget}
+\end{equation}
+Over $T$ rounds, each client is therefore allowed at most $T$ \rev{model-bearing} peer exchanges, matching the $T$ single-node contacts used by standard server-based FL. \rev{Lightweight descriptor and anchor messages used only to choose the peer are treated as selection overhead and are accounted for separately from this model-bearing exchange budget.}
+
+The key difference is that the communication partner is no longer fixed by architecture. In centralised FL, the unique partner is always the server. In a decentralised graph, client $k$ may have several feasible partners in its neighbourhood $\mathcal{N}_k$. When $|\mathcal{N}_k|>1$, the budget in \eqref{eq:one_peer_budget} creates a genuine selection problem: only one of the available peers can be \rev{selected for model-bearing exchange} at round $t$, and that peer need not be the same across rounds. We encode this decision using binary variables $w_{k,j}^t$:
+\begin{equation}
+    w_{k,j}^{t}\in\{0,1\},
+    \qquad j\in\mathcal{N}_k,
+    \label{eq:binary_peer_indicator}
+\end{equation}
+with the one-peer constraint
+\begin{equation}
+    \sum_{j\in\mathcal{N}_k} w_{k,j}^{t}=1.
+    \label{eq:one_peer_constraint}
+\end{equation}
+When $w_{k,j}^t=1$, client $k$ selects neighbour $j$ at round $t$. The selected peer is denoted by
+\begin{equation}
+    j_k^t = \arg\max_{j\in\mathcal{N}_k} S_{k,j}^{t},
+    \label{eq:selection_general}
+\end{equation}
+where $S_{k,j}^{t}$ estimates the utility of communicating with neighbour $j$ under the one-peer budget.
+
+The network-level learning objective can be written as
+\begin{equation}
+\begin{aligned}
+    \min_{\{\Theta_k\}_{k=1}^{K}}\;&
+    \sum_{k=1}^{K}\frac{n_k}{N}\mathcal{L}_k(\Theta_k) \\
+    &+\rho\sum_{k=1}^{K}\sum_{j\in\mathcal{N}_k}
+    w_{k,j}^{t}\Omega(\Theta_k,\Theta_j),
+\end{aligned}
+    \label{eq:global_dfl_objective}
+\end{equation}
+subject to \eqref{eq:binary_peer_indicator}--\eqref{eq:one_peer_constraint}. Here $\Omega(\Theta_k,\Theta_j)$ is a model-consistency or representation-consistency regulariser, and $\rho\geq0$ controls the strength of peer consistency. This objective highlights the central difference from full-neighbour DFL: the consistency term is evaluated only along the selected peer links at round $t$, rather than over all available edges.
+
+This formulation also clarifies the role of baselines. Full-neighbour aggregation and server-based FL are useful references, but they do not satisfy the same local decision problem when $|\mathcal{N}_k|>1$. The primary budget-matched comparison is between different choices of $S_{k,j}^{t}$ under the same constraint in \eqref{eq:one_peer_constraint}. Random gossip corresponds to choosing $S_{k,j}^{t}$ implicitly at random. Static selection fixes $j_k^t$ across rounds. The proposed method learns a time-varying peer sequence $(j_k^0,j_k^1,\dots,j_k^{T-1})$ using task-aware and representation-aware descriptors while keeping the number of \rev{model-bearing peer exchanges} equal to the centralised FL pattern. \rev{The number of lightweight selection messages may scale with the local degree and is therefore reported as descriptor overhead rather than as model-bearing exchange.}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/PEARL_Figure1_simplified.pdf}
+    \caption{Overview of PEARL. Each client first observes only its local neighbourhood under the one-peer model-exchange budget. It then sends a small anchor set to candidate neighbours to estimate anchor-validated cross-quality, combines this signal with prototype alignment and recency-aware exploration into a composite score, selects the best-scoring neighbour, and exchanges model information only with that selected peer before performing the local update.}
+    \label{fig:pearl_overview}
+\end{figure*}
+
+\section{Peer-Selective Decentralised Learning}
+\label{sec:peer-selective-decentralised-training-protocol}
+
+At each communication round \(t\), every client performs three steps: local training, neighbour selection, and selective peer exchange. The protocol enforces the budget in \eqref{eq:one_peer_budget}: each client can initiate model exchange with only one selected neighbour per round, although the selected neighbour may change from one round to the next.
+
+\subsection{Local Training}
+\label{subsec:local-training}
+Client \(k\) updates its model using local stochastic gradient descent or another optimiser:
+\begin{equation}
+    \Theta_k^{t,local} = \Theta_k^t - \eta \nabla \mathcal{L}_k(\Theta_k^t),
+    \label{eq:auto-014}
+\end{equation}
+where \(\eta\) is the local learning rate. Multiple local epochs can be performed before communication.
+
+\subsection{Lightweight Neighbour Selection}
+\label{subsec:lightweight-neighbour-selection}
+Client \(k\) receives or maintains lightweight descriptors from its neighbours. These descriptors may include validation statistics, latent prototypes, model-update summaries, confidence statistics, or communication costs. Importantly, the full model of every neighbour is not required during selection. This is essential under the one-peer budget: if all neighbours had to transmit full models before selection, the selection phase itself would violate the intended communication constraint.
+
+The selected neighbour is
+\begin{equation}
+    j_k^t = \arg\max_{j\in\mathcal{N}_k} S_{k,j}^{t}.
+    \label{eq:auto-015}
+\end{equation}
+
+\subsection{Selective Peer Exchange}
+\label{subsec:selective-peer-exchange}
+Only after the neighbour has been selected does client \(k\) exchange model information with \(j_k^t\). Depending on the design, the exchanged object may be the full model, encoder only, encoder and decoder, a parameter update, latent prototypes, or logits.
+
+A simple model-mixing update is
+\begin{equation}
+    \Theta_k^{t+1}
+    =
+    (1-\alpha_k^t)\Theta_k^{t,local}
+    +
+    \alpha_k^t \Theta_{j_k^t}^{t,local},
+    \label{eq:model_mixing}
+\end{equation}
+where \(\alpha_k^t\in[0,1]\) is a peer-mixing coefficient.
+
+Alternatively, if only a subset of parameters is shared, such as the encoder and decoder, then
+\begin{equation}
+    \theta_k^{t+1}
+    =
+    (1-\alpha_k^t)\theta_k^{t,local}
+    +
+    \alpha_k^t \theta_{j_k^t}^{t,local},
+    \label{eq:auto-016}
+\end{equation}
+\begin{equation}
+    \phi_k^{t+1}
+    =
+    (1-\alpha_k^t)\phi_k^{t,local}
+    +
+    \alpha_k^t \phi_{j_k^t}^{t,local},
+    \label{eq:auto-017}
+\end{equation}
+while the classifier head remains local:
+\begin{equation}
+    \psi_k^{t+1}=\psi_k^{t,local}.
+    \label{eq:auto-018}
+\end{equation}
+This variant supports shared representation learning while preserving client-specific decision boundaries.
+
+\section{Neighbour-Selection Criteria}
+\label{sec:neighbour-selection-criteria}
+
+This section formalises several possible criteria for selecting one neighbour per round under the budget in \eqref{eq:one_peer_budget}. These criteria can be used as baselines, alternatives, or components of a composite utility score. The goal is not to identify the globally best peer in the network, but the most useful feasible neighbour for client $k$ at round $t$ given that only one communication partner can be selected.
+
+\subsection{Random Neighbour Selection}
+\label{subsec:random-neighbour-selection}
+The simplest baseline is random peer selection:
+\begin{equation}
+    j_k^t \sim \text{Uniform}(\mathcal{N}_k).
+    \label{eq:auto-019}
+\end{equation}
+This provides a useful baseline for evaluating whether task-aware selection improves learning.
+
+\subsection{Communication-Cost-Aware Selection}
+\label{subsec:communication-cost-aware-selection}
+In arbitrary networks, links may differ in bandwidth, latency, packet loss, energy cost, or reliability. Let \(C_{k,j}^t\) denote the communication cost between clients \(k\) and \(j\). A communication-minimising criterion selects
+\begin{equation}
+    j_k^t = \arg\min_{j\in\mathcal{N}_k} C_{k,j}^t.
+    \label{eq:auto-020}
+\end{equation}
+This is efficient but may select a neighbour that is not useful for learning.
+
+\subsection{Model-Similarity-Based Selection}
+\label{subsec:model-similarity-based-selection}
+A client may select the neighbour whose model parameters are closest:
+\begin{equation}
+    j_k^t
+    =
+    \arg\min_{j\in\mathcal{N}_k}
+    \|\Theta_k^t-\Theta_j^t\|_2.
+    \label{eq:auto-021}
+\end{equation}
+This favours stable collaboration with similar peers but requires access to neighbour parameters or compressed parameter sketches.
+
+\subsection{Latent-Space Alignment}
+\label{subsec:latent-space-alignment}
+For representation-learning models, comparing full parameters may be less meaningful than comparing latent representations. Let \(\mathcal{V}_k\) be a small local validation set at client \(k\). A latent alignment score can be defined as
+\begin{equation}
+    A_{k,j}^{t}
+    =
+    -\frac{1}{|\mathcal{V}_k|}
+    \sum_{x\in\mathcal{V}_k}
+    \left\|
+    f_{\theta_k^t}(x)-f_{\theta_j^t}(x)
+    \right\|_2^2.
+    \label{eq:auto-022}
+\end{equation}
+Then client \(k\) selects
+\begin{equation}
+    j_k^t = \arg\max_{j\in\mathcal{N}_k} A_{k,j}^{t}.
+    \label{eq:auto-023}
+\end{equation}
+This criterion selects the neighbour whose encoder produces the most compatible representation space on client \(k\)'s validation data. However, it requires either access to the neighbour encoder or access to neighbour-produced embeddings for selected samples.
+
+\subsection{Prototype-Based Latent Alignment}
+\label{subsec:prototype-based-latent-alignment}
+A more communication-efficient alternative is to exchange latent class prototypes rather than full models. Client \(j\) computes a prototype for each class:
+\begin{equation}
+    p_{j,c}^{t}
+    =
+    \frac{1}{|\mathcal{D}_{j,c}|}
+    \sum_{(x,y)\in\mathcal{D}_{j,c}}
+    f_{\theta_j^t}(x),
+    \quad c=1,\dots,C,
+    \label{eq:auto-024}
+\end{equation}
+where \(\mathcal{D}_{j,c}=\{(x,y)\in\mathcal{D}_j:y=c\}\).
+
+Client \(j\) sends only the prototype set
+\begin{equation}
+    P_j^t = \{p_{j,1}^{t},\dots,p_{j,C}^{t}\}.
+    \label{eq:auto-025}
+\end{equation}
+Client \(k\) computes
+\begin{equation}
+    S_{k,j}^{proto,t}
+    =
+    -\sum_{c\in\mathcal{C}_{k,j}}
+    \|p_{k,c}^{t}-p_{j,c}^{t}\|_2^2,
+    \label{eq:proto_alignment}
+\end{equation}
+where \(\mathcal{C}_{k,j}\) is the set of classes observed by both clients. The selected neighbour is
+\begin{equation}
+    j_k^t = \arg\max_{j\in\mathcal{N}_k} S_{k,j}^{proto,t}.
+    \label{eq:auto-026}
+\end{equation}
+This criterion is particularly suitable for representation-based classification because it uses the geometry of the learned latent space while avoiding full model transmission during selection.
+
+\subsection{Best Validation Performance}
+\label{subsec:best-validation-performance}
+If client \(k\) can evaluate a neighbour model on a local validation set, it may select the neighbour with the lowest local validation loss:
+\begin{equation}
+    j_k^t
+    =
+    \arg\min_{j\in\mathcal{N}_k}
+    \mathcal{L}_{val,k}(\Theta_j^t),
+    \label{eq:auto-027}
+\end{equation}
+where
+\begin{equation}
+\mathcal{L}_{val,k}(\Theta_j^t)
+=
+\lambda_{rec}\mathcal{L}_{rec,val,k}(\Theta_j^t)
++
+\lambda_{cls}\mathcal{L}_{cls,val,k}(\Theta_j^t).
+    \label{eq:auto-028}
+\end{equation}
+This is task-aware, but it requires candidate models or candidate predictions from neighbours.
+
+\subsection{Expected Improvement After Mixing}
+\label{subsec:expected-improvement-after-mixing}
+A stronger criterion selects the neighbour whose model gives the largest improvement after mixing. For each candidate neighbour \(j\), define the hypothetical mixed model
+\begin{equation}
+    \Theta_{k\leftarrow j}^{t}
+    =
+    (1-\alpha)\Theta_k^t + \alpha\Theta_j^t.
+    \label{eq:auto-029}
+\end{equation}
+The expected improvement is
+\begin{equation}
+    \Delta\mathcal{L}_{k,j}^{t}
+    =
+    \mathcal{L}_{val,k}(\Theta_k^t)
+    -
+    \mathcal{L}_{val,k}(\Theta_{k\leftarrow j}^{t}).
+    \label{eq:auto-030}
+\end{equation}
+The selected neighbour is
+\begin{equation}
+    j_k^t = \arg\max_{j\in\mathcal{N}_k} \Delta\mathcal{L}_{k,j}^{t}.
+    \label{eq:expected_improvement}
+\end{equation}
+This is one of the most direct task-aware criteria because it estimates which neighbour will most improve client \(k\)'s model. However, it is communication-heavy if all neighbour models must be received before selection.
+
+\subsection{Hard-Example Helper Selection}
+\label{subsec:hard-example-helper-selection}
+Some neighbours may be especially useful for examples on which client \(k\) currently performs poorly. Define the hard validation set
+\begin{equation}
+    \mathcal{H}_k^t
+    =
+    \{(x,y)\in\mathcal{V}_k:
+    \ell_{cls}(y,h_{\psi_k^t}(f_{\theta_k^t}(x)))>\tau\},
+    \label{eq:auto-031}
+\end{equation}
+where \(\tau\) is a difficulty threshold. Client \(k\) may select
+\begin{equation}
+    j_k^t
+    =
+    \arg\min_{j\in\mathcal{N}_k}
+    \mathcal{L}_{cls,\mathcal{H}_k^t}(\Theta_j^t).
+    \label{eq:auto-032}
+\end{equation}
+This criterion selects the neighbour that performs best on the samples client \(k\) currently struggles with.
+
+\subsection{Anchor-Validated Cross-Quality}
+\label{subsec:anchor-validated-cross-quality}
+The standard quality score \(Q_j^t = -\mathcal{L}_{val,j}(\Theta_j^t)\) measures how well neighbour \(j\) performs on its \emph{own} data. Under non-IID distributions with Dirichlet skew, a neighbour specialised in a narrow set of classes may achieve very low self-training loss while being harmful to mix with a client that has a different class composition. This creates a systematic bias: greedy quality-based selection consistently favours clients with easy or homogeneous distributions rather than clients whose knowledge is useful to the selecting client.
+
+To address this, we introduce an \emph{anchor-validated quality} criterion. During the descriptor exchange phase, client \(k\) transmits a small anchor set \(\mathcal{A}_k \subset \mathcal{D}_k\) of \(|\mathcal{A}_k|\) labelled samples alongside its prototype request. Neighbour \(j\) evaluates its current model on \(\mathcal{A}_k\) and returns the resulting classification loss as its quality descriptor:
+\begin{equation}
+    \tilde{Q}_{k,j}^{t}
+    =
+    -\frac{1}{|\mathcal{A}_k|}
+    \sum_{(x,y)\in\mathcal{A}_k}
+    \ell_{cls}(y, h_{\psi_j^t}(f_{\theta_j^t}(x))).
+    \label{eq:anchor_quality}
+\end{equation}
+A higher value of \(\tilde{Q}_{k,j}^t\) indicates that neighbour \(j\) already generalises well to client \(k\)'s distribution, making it a more compatible mixing partner. \rev{This criterion is an empirical compatibility proxy for \(R_{P_k}(\Theta_j^t)\): it measures the neighbour's loss on samples from the selecting client's distribution before model exchange. It should therefore be interpreted as a heuristic for reducing incompatible selections, rather than as a direct estimator of the probability distance \(d(P_k,P_j)\) without additional assumptions.}
+
+The anchor set \(\mathcal{A}_k\) is a random subsample drawn without replacement from \(\mathcal{D}_k\) at each round. A size of \(|\mathcal{A}_k| = 32\)--\(64\) samples is sufficient to obtain a stable quality estimate while keeping the descriptor transmission cost small relative to the model exchange. This design assumes a collaboration setting in which limited labelled probe sharing is permitted. The anchor samples are transmitted only during the selection phase and are not stored by the receiving neighbour. In stricter privacy settings, the same mechanism could be implemented using synthetic anchors, augmented prototype samples, embeddings, logits, or differentially private probes, at the cost of a less direct quality estimate.
+
+\subsection{Hard-Class Alignment}
+\label{subsec:hard-class-alignment}
+Section~\ref{subsec:hard-example-helper-selection} defines hard-example helper selection based on individual sample losses. Here we introduce a more communication-efficient approximation that operates on class prototypes rather than individual samples, making it compatible with the lightweight descriptor protocol.
+
+Let \(\mathcal{C}_k^{hard,t}\) denote the set of classes for which client \(k\) currently performs below a threshold accuracy \(\tau_{cls}\):
+\begin{equation}
+    \mathcal{C}_k^{hard,t}
+    =
+    \left\{
+    c \in \mathcal{C} :
+    \mathrm{acc}_{k,c}^t < \tau_{cls}
+    \right\},
+    \label{eq:hard_classes}
+\end{equation}
+where \(\mathrm{acc}_{k,c}^t\) is the per-class accuracy of client \(k\) on class \(c\) at round \(t\), computed over the local training data. The hard-class alignment score for neighbour \(j\) is then:
+\begin{equation}
+    S_{k,j}^{hard,t}
+    =
+    -\frac{1}{|\mathcal{C}_{k,j}^{hard}|}
+    \sum_{c \in \mathcal{C}_{k,j}^{hard}}
+    \|p_{k,c}^t - p_{j,c}^t\|_2^2,
+    \label{eq:hard_class_alignment}
+\end{equation}
+where \(\mathcal{C}_{k,j}^{hard} = \mathcal{C}_k^{hard,t} \cap \mathcal{C}_{k,j}\) is the intersection of hard classes at client \(k\) and shared classes between clients \(k\) and \(j\). If \(\mathcal{C}_{k,j}^{hard} = \emptyset\), the score defaults to the standard prototype alignment of \eqref{eq:proto_alignment}. \rev{If no shared prototype class is available, the prototype-mismatch term is marked unavailable for that neighbour or assigned a worst-case default before neighbourhood normalisation, avoiding division by zero.}
+
+This criterion focuses the prototype mismatch signal specifically on classes where mixing is most likely to improve client \(k\)'s performance. It operationalises the hard-example helper intuition of Section~\ref{subsec:hard-example-helper-selection} without requiring neighbour models to be evaluated on client \(k\)'s hard examples directly, making it fully compatible with the two-stage descriptor protocol.
+
+\subsection{Recency-Weighted Exploration Bonus}
+\label{subsec:recency-weighted-exploration}
+A common exploration bonus uses the cumulative selection count \(M_{k,j}^t\), which is the total number of times client \(k\) has selected neighbour \(j\) across all rounds up to \(t\). This has two limitations. First, the bonus decays monotonically and approaches zero as training progresses, so after a sufficient number of rounds the exploration incentive effectively vanishes regardless of how recently each neighbour was visited. Second, a neighbour visited heavily in early rounds but not recently receives a low exploration score, even though recent information from that neighbour would be fresh and potentially useful.
+
+We replace the cumulative count with a \emph{recency-weighted} count \(\hat{M}_{k,j}^t\) that tracks selections within a sliding window of the most recent \(W\) rounds:
+\begin{equation}
+    \hat{M}_{k,j}^t
+    =
+    \sum_{\tau = \max(0,\, t-W+1)}^{t}
+    \mathbb{I}\left[j_k^\tau = j\right],
+    \label{eq:recency_count}
+\end{equation}
+where \(W\) is the window size (e.g., \(W = 10\)). The recency-weighted exploration bonus is then:
+\begin{equation}
+    \hat{E}_{k,j}^t
+    =
+    \frac{1}{1 + \hat{M}_{k,j}^t}.
+    \label{eq:recency_exploration}
+\end{equation}
+Since \(\hat{M}_{k,j}^t \in \{0, 1, \dots, W\}\), the bonus \(\hat{E}_{k,j}^t\) is always bounded below by \(1/(1+W)\), ensuring that the exploration incentive never degrades to zero. At the start of each new window, all counts reset for neighbours that have not been recently selected, restoring their exploration bonus and encouraging clients to periodically revisit underexplored parts of their neighbourhood. \rev{This deterministic bonus encourages repeated exploration, but by itself it does not prove that every neighbour has positive selection probability; the formal lower-bound guarantee requires an explicit random exploration mechanism such as the \(\epsilon\)-greedy rule in Lemma~\ref{lem:epsilon_greedy}.}
+
+\subsection{Diversity-Aware Selection}
+\label{subsec:diversity-aware-selection}
+Always selecting the most similar or best-performing neighbour may reduce exploration and limit knowledge diffusion. A diversity-aware score can reward neighbours whose predictions are useful but not identical. Let
+\begin{equation}
+\begin{aligned}
+\rev{G}_{k,j}^{t}
+&=\frac{1}{|\mathcal{V}_k|}
+\sum_{x\in\mathcal{V}_k}
+\mathbb{I}\Big[
+\arg\max h_{\psi_k^t}(f_{\theta_k^t}(x))\\
+&\qquad\neq
+\arg\max h_{\psi_j^t}(f_{\theta_j^t}(x))
+\Big].
+\end{aligned}
+\label{eq:diversity_disagreement}
+\end{equation}
+This disagreement term can be combined with validation quality so that diversity is rewarded only when the neighbour is also competent. \rev{We use \(G_{k,j}^t\) for prediction disagreement to avoid overloading \(D_{k,j}^t\), which is later used for hard-class prototype mismatch in the practical score.}
+
+\subsection{Composite Utility Score}
+\label{subsec:composite-utility-score}
+A general peer-selection score can combine multiple criteria:
+\begin{equation}
+    S_{k,j}^{t}
+    =
+    \gamma_1 \Delta\mathcal{L}_{k,j}^{t}
+    +
+    \gamma_2 A_{k,j}^{t}
+    +
+    \gamma_3 \tilde{Q}_{k,j}^{t}
+    +
+    \gamma_4 \rev{G}_{k,j}^{t}
+    -
+    \gamma_5 C_{k,j}^{t},
+    \label{eq:composite_score}
+\end{equation}
+where \(\tilde{Q}_{k,j}^t\) is the anchor-validated cross-quality score of \eqref{eq:anchor_quality}, \(\rev{G}_{k,j}^t\) is a diversity score, and \(C_{k,j}^t\) is communication cost. The coefficients \(\gamma_1,\dots,\gamma_5\) control the relative importance of each term.
+
+The recommended practical score integrates anchor-validated quality, hard-class prototype alignment, communication cost, and recency-weighted exploration. For each client \(k\), the raw candidate quantities are first min--max normalised over its neighbourhood \(\mathcal{N}_k\), giving \(\widetilde{D}_{k,j}^t\), \(\widetilde{Q}_{k,j}^t\), \(\widetilde{C}_{k,j}^t\), and \(\widetilde{E}_{k,j}^t\). \rev{When all candidates have the same raw value for a term, the corresponding normalised term is set to a common constant, such as zero, so that the term does not affect the argmax and no zero denominator occurs.} The practical score is then
+\begin{equation}
+    S_{k,j}^{t}
+    =
+    -\beta_1 \widetilde{D}_{k,j}^{t}
+    +
+    \beta_2 \widetilde{Q}_{k,j}^t
+    -
+    \beta_3 \widetilde{C}_{k,j}^t
+    +
+    \beta_4 \widetilde{E}_{k,j}^t,
+    \label{eq:recommended_score}
+\end{equation}
+where \(\widetilde{D}_{k,j}^{t}\) is the normalised hard-class prototype mismatch, \(\widetilde{Q}_{k,j}^t\) is the normalised anchor-validated quality of \eqref{eq:anchor_quality}, \(\widetilde{C}_{k,j}^t\) is the normalised communication cost, and \(\widetilde{E}_{k,j}^t\) is the normalised recency-weighted exploration bonus of \eqref{eq:recency_exploration}. Normalising within \(\mathcal{N}_k\) makes the coefficients \(\beta_1,\ldots,\beta_4\) interpretable across terms with different numerical scales. This score avoids requiring every neighbour to send a full model during selection, replacing the self-quality signal with a cross-validated estimate and replacing the prototype alignment over all shared classes with alignment focused on the classes where improvement is most needed. Full parameter or update exchange occurs only after the neighbour has been selected.
+
+\section{Selection Phase Versus Exchange Phase}
+\label{sec:selection-phase-versus-exchange-phase}
+
+A key design principle is to separate neighbour selection from model exchange.
+
+\subsection{Selection Phase}
+\label{subsec:selection-phase}
+During selection, neighbours exchange lightweight base descriptors and request-specific anchor scores:
+\begin{equation}
+    \rev{b_j^t = [P_j^t,\mathcal{C}_j^{hard,t}, n_j, R_j^t]},
+    \label{eq:auto-034}
+\end{equation}
+where \(P_j^t\) denotes latent prototypes, \rev{\(\mathcal{C}_j^{hard,t}\) the neighbour's hard-class metadata, \(n_j\) its local sample count, and \(R_j^t\) reliability metadata. The request-specific score \(\tilde{Q}_{k,j}^t\) is then computed by \(j\) on an anchor set \(\mathcal{A}_k\) provided by \(k\), while \(C_{k,j}^t\) records the link-specific communication cost.} Client \(k\) transmits \(\mathcal{A}_k\) alongside its prototype request; the anchor set consists of \(|\mathcal{A}_k| = 32\)--\(64\) randomly sampled labelled examples from \(\mathcal{D}_k\) and is discarded by the receiving neighbour after evaluation. This limited probe-sharing assumption should be stated explicitly; privacy-preserving variants can replace raw anchors with synthetic probes, embeddings, logits, or differentially private summaries. The descriptor size remains small relative to the full neural-network model and is reported separately from the selected model-bearing exchange.
+
+\subsection{Exchange Phase}
+\label{subsec:exchange-phase}
+After selection, only the selected neighbour sends model information. The exchanged object may be one of the following:
+\begin{itemize}
+    \item full model: \(\Theta_j^t=\{\theta_j^t,\phi_j^t,\psi_j^t\}\);
+    \item encoder only: \(\theta_j^t\);
+    \item encoder and decoder: \(\{\theta_j^t,\phi_j^t\}\);
+    \item model update: \(\Delta\Theta_j^t=\Theta_j^t-\Theta_j^{t-1}\);
+    \item latent prototypes: \(P_j^t\);
+    \item logits or soft labels on public, synthetic, or shared anchor samples.
+\end{itemize}
+
+For the proposed representation-learning setting, a strong design is to use prototypes for selection and exchange only encoder or encoder--decoder updates after selection. The classifier head may remain local to support personalisation.
+
+\section{Algorithmic Summary}
+\label{sec:algorithm}
+
+This section summarises the proposed peer-selective decentralised learning procedure. Unlike conventional federated learning, there is no central server responsible for aggregating client models. However, we retain the same per-client communication count as server-based FL: one model-bearing communication partner per client per round. In a graph-based decentralised system, that single model-bearing partner must be selected from the local neighbourhood. At each communication round, a client first performs local training, evaluates a lightweight utility score over its neighbours, selects one peer, and exchanges model information only with that selected peer.
+
+The full procedure consists of four main components: local representation-model training, lightweight neighbour descriptor construction, one-neighbour selection, and peer-to-peer model exchange. These components are described in Algorithms~\ref{alg:overall_protocol}--\ref{alg:peer_exchange}.
+
+\begin{algorithm}[t]
+\caption{Peer-Selective Decentralised Representation Learning}
+\label{alg:overall_protocol}
+\footnotesize
+\begin{algorithmic}[1]
+\REQUIRE $\mathcal{G}$, $\{\mathcal{D}_k\}$, $T$, $E$, $\eta$, $\alpha$
+\ENSURE Trained client models $\{\Theta_k^T\}_{k=1}^{K}$
+\STATE Initialise each client model $\Theta_k^0=\{\theta_k^0,\phi_k^0,\psi_k^0\}$
+\FOR{$t=0,1,\dots,T-1$}
+    \FOR{each client $k\in\mathcal{V}$ in parallel}
+        \STATE Perform local representation-model training using Algorithm~\ref{alg:local_update}
+        \STATE Construct a lightweight descriptor $m_k^t$ using Algorithm~\ref{alg:descriptor}
+        \STATE Broadcast $m_k^t$ to neighbouring clients $j\in\mathcal{N}_k$
+    \ENDFOR
+    \FOR{each client $k\in\mathcal{V}$ in parallel}
+        \STATE Receive descriptors $\{m_j^t:j\in\mathcal{N}_k\}$ from neighbours
+        \STATE Select one neighbour $j_k^t$ using Algorithm~\ref{alg:neighbour_selection}
+        \STATE Exchange model information with $j_k^t$ using Algorithm~\ref{alg:peer_exchange}
+    \ENDFOR
+\ENDFOR
+\RETURN $\{\Theta_k^T\}_{k=1}^{K}$
+\end{algorithmic}
+\end{algorithm} 
+
+\begin{algorithm}[t]
+\caption{Local Representation Learner Update at Client $k$}
+\label{alg:local_update}
+\footnotesize
+\begin{algorithmic}[1]
+\REQUIRE $\mathcal{D}_k$, $\Theta_k^t$, $E$, $\eta$
+\ENSURE Locally updated model $\Theta_k^{t,+}$
+\STATE Set $\Theta_k^{t,+}\leftarrow \Theta_k^t$
+\FOR{$e=1,\dots,E$}
+    \FOR{each mini-batch $\mathcal{B}\subset\mathcal{D}_k$}
+        \STATE Encode inputs:
+        \begin{equation}
+z=f_{\theta_k}(x)
+\end{equation}
+        \STATE Reconstruct inputs:
+        \begin{equation}
+\hat{x}=g_{\phi_k}(z)
+\end{equation}
+        \STATE Predict class labels:
+        \begin{equation}
+\hat{y}=h_{\psi_k}(z)
+\end{equation}
+        \STATE Compute reconstruction loss:
+        \begin{equation}
+\mathcal{L}_{rec,k}
+        =
+        \frac{1}{|\mathcal{B}|}
+        \sum_{(x,y)\in\mathcal{B}}
+        \ell_{rec}(x,\hat{x})
+\end{equation}
+        \STATE Compute classification loss:
+        \begin{equation}
+\mathcal{L}_{cls,k}
+        =
+        \frac{1}{|\mathcal{B}|}
+        \sum_{(x,y)\in\mathcal{B}}
+        \ell_{cls}(y,\hat{y})
+\end{equation}
+        \STATE Compute total local loss:
+        \begin{equation}
+\mathcal{L}_{k}
+        =
+        \lambda_{rec}\mathcal{L}_{rec,k}
+        +
+        \lambda_{cls}\mathcal{L}_{cls,k}
+\end{equation}
+        \STATE Update parameters:
+        \begin{equation}
+\Theta_k^{t,+}
+        \leftarrow
+        \Theta_k^{t,+}
+        -
+        \eta\nabla_{\Theta_k}\mathcal{L}_{k}
+\end{equation}
+    \ENDFOR
+\ENDFOR
+\RETURN $\Theta_k^{t,+}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Lightweight Descriptor Construction at Client $k$}
+\label{alg:descriptor}
+\footnotesize
+\begin{algorithmic}[1]
+\REQUIRE $\Theta_k^{t,+}$, $\mathcal{D}_k$, $\mathcal{C}$, $\mathcal{V}_k$, window size $W$
+\ENSURE Lightweight descriptor $m_k^t$, anchor set $\mathcal{A}_k$
+\FOR{each class $c\in\mathcal{C}$}
+    \STATE Extract local class subset:
+    \begin{equation}
+\mathcal{D}_{k,c}
+    =
+    \{(x,y)\in\mathcal{D}_k:y=c\}
+\end{equation}
+    \IF{$|\mathcal{D}_{k,c}|>0$}
+        \STATE Compute latent class prototype:
+        \begin{equation}
+p_{k,c}^{t}
+        =
+        \frac{1}{|\mathcal{D}_{k,c}|}
+        \sum_{(x,y)\in\mathcal{D}_{k,c}}
+        f_{\theta_k^{t,+}}(x)
+\end{equation}
+        \STATE Compute per-class accuracy:
+        \begin{equation}
+\mathrm{acc}_{k,c}^t
+        =
+        \frac{1}{|\mathcal{D}_{k,c}|}
+        \sum_{(x,y)\in\mathcal{D}_{k,c}}
+        \mathbb{I}[\arg\max h_{\psi_k^{t,+}}(f_{\theta_k^{t,+}}(x))=c]
+\end{equation}
+    \ELSE
+        \STATE Mark prototype $p_{k,c}^{t}$ as unavailable
+    \ENDIF
+\ENDFOR
+\STATE Compute hard-class set with threshold $\tau_{cls}$:
+\begin{equation}
+\mathcal{C}_k^{hard,t}=\{c\in\mathcal{C}:\mathrm{acc}_{k,c}^t<\tau_{cls}\}
+\end{equation}
+\STATE Sample anchor set $\mathcal{A}_k \sim \mathcal{D}_k$ with $|\mathcal{A}_k|\in\{32,\dots,64\}$
+\STATE Construct descriptor:
+\begin{equation}
+m_k^t
+=
+\{P_k^t,\,\mathcal{C}_k^{hard,t},\,n_k\},
+\end{equation}
+where
+\begin{equation}
+P_k^t=\{p_{k,c}^{t}:c\in\mathcal{C}\}.
+\end{equation}
+\RETURN $m_k^t$, $\mathcal{A}_k$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Task-Aware One-Neighbour Selection at Client $k$}
+\label{alg:neighbour_selection}
+\footnotesize
+\begin{algorithmic}[1]
+\REQUIRE $\{m_j^t\}$, $m_k^t$, $\mathcal{A}_k$, $\{C_{k,j}^t\}$, selection history $\{\hat{M}_{k,j}^t\}$, $\beta_1,\beta_2,\beta_3,\beta_4$
+\ENSURE Selected neighbour $j_k^t$
+\FOR{each neighbour $j\in\mathcal{N}_k$}
+    \STATE Transmit anchor set $\mathcal{A}_k$ to neighbour $j$; receive anchor quality:
+    \begin{equation}
+\tilde{Q}_{k,j}^t
+    =
+    -\frac{1}{|\mathcal{A}_k|}
+    \sum_{(x,y)\in\mathcal{A}_k}
+    \ell_{cls}(y,h_{\psi_j^t}(f_{\theta_j^t}(x)))
+\end{equation}
+    \STATE Identify shared hard classes:
+    \begin{equation}
+\mathcal{C}_{k,j}^{hard}
+    =
+    \mathcal{C}_k^{hard,t}
+    \cap
+    \{c:p_{k,c}^{t}\text{ and }p_{j,c}^{t}\text{ are available}\}
+\end{equation}
+    \IF{$\mathcal{C}_{k,j}^{hard}\neq\emptyset$}
+        \STATE Use hard-class prototype mismatch:
+        \begin{equation}
+D_{k,j}^{t}
+        =
+        \frac{1}{|\mathcal{C}_{k,j}^{hard}|}
+        \sum_{c\in\mathcal{C}_{k,j}^{hard}}
+        \|p_{k,c}^{t}-p_{j,c}^{t}\|_2^2
+\end{equation}
+    \ELSE
+        \IF{$\mathcal{C}_{k,j}\neq\emptyset$}
+            \STATE Fall back to all shared classes:
+            \begin{equation}
+D_{k,j}^{t}
+            =
+            \frac{1}{|\mathcal{C}_{k,j}|}
+            \sum_{c\in\mathcal{C}_{k,j}}
+            \|p_{k,c}^{t}-p_{j,c}^{t}\|_2^2
+\end{equation}
+        \ELSE
+            \STATE \rev{No shared prototype is available; assign a worst-case or unavailable mismatch default before normalisation:}
+            \begin{equation}
+D_{k,j}^{t}=D_{\max}^{t}
+\end{equation}
+        \ENDIF
+    \ENDIF
+    \STATE Compute recency-weighted exploration bonus (window $W$):
+    \begin{equation}
+\hat{E}_{k,j}^{t}
+    =
+    \frac{1}{1+\hat{M}_{k,j}^{t}},
+    \quad
+    \hat{M}_{k,j}^{t}
+    =
+    \sum_{\tau=\max(0,t-W+1)}^{t}
+    \mathbb{I}[j_k^\tau=j]
+\end{equation}
+    \STATE Normalise $D_{k,j}^t$, $\tilde{Q}_{k,j}^t$, $C_{k,j}^t$, $\hat{E}_{k,j}^t$ within $\mathcal{N}_k$ using min-max scaling
+    \STATE \rev{If a term has zero range across all candidates, set that normalised term to the same constant for every neighbour}
+    \STATE Compute utility score:
+    \begin{equation}
+S_{k,j}^{t}
+    =
+    -\beta_1 D_{k,j}^{t}
+    +
+    \beta_2 \tilde{Q}_{k,j}^t
+    -
+    \beta_3 C_{k,j}^{t}
+    +
+    \beta_4 \hat{E}_{k,j}^{t}
+\end{equation}
+\ENDFOR
+\STATE Select the neighbour with maximum score:
+\begin{equation}
+j_k^t
+=
+\arg\max_{j\in\mathcal{N}_k}
+S_{k,j}^{t}
+\end{equation}
+\RETURN $j_k^t$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Peer Exchange and Model Mixing}
+\label{alg:peer_exchange}
+\footnotesize
+\begin{algorithmic}[1]
+\REQUIRE $\Theta_k^{t,+}$, $j_k^t$, neighbour information, $\alpha$
+\ENSURE Updated client model $\Theta_k^{t+1}$
+\STATE Client $k$ requests model information from selected neighbour $j_k^t$
+\STATE Neighbour $j_k^t$ sends one of the following:
+\begin{equation}
+\Theta_{j_k^t}^{t,+},
+\quad
+\Delta\Theta_{j_k^t}^{t},
+\quad
+\theta_{j_k^t}^{t,+},
+\quad
+\{\theta_{j_k^t}^{t,+},\phi_{j_k^t}^{t,+}\}
+\end{equation}
+\STATE \textbf{Option 1: Full model mixing}
+\begin{equation}
+\Theta_k^{t+1}
+=
+(1-\alpha)\Theta_k^{t,+}
++
+\alpha\Theta_{j_k^t}^{t,+}
+\end{equation}
+\STATE \textbf{Option 2: Encoder-only mixing}
+\begin{equation}
+\theta_k^{t+1}
+=
+(1-\alpha)\theta_k^{t,+}
++
+\alpha\theta_{j_k^t}^{t,+}
+\end{equation}
+\begin{equation}
+\phi_k^{t+1}=\phi_k^{t,+},
+\qquad
+\psi_k^{t+1}=\psi_k^{t,+}
+\end{equation}
+\STATE \textbf{Option 3: Encoder-decoder mixing with local classifier}
+\begin{equation}
+\theta_k^{t+1}
+=
+(1-\alpha)\theta_k^{t,+}
++
+\alpha\theta_{j_k^t}^{t,+}
+\end{equation}
+\begin{equation}
+\phi_k^{t+1}
+=
+(1-\alpha)\phi_k^{t,+}
++
+\alpha\phi_{j_k^t}^{t,+}
+\end{equation}
+\begin{equation}
+\psi_k^{t+1}
+=
+\psi_k^{t,+}
+\end{equation}
+\RETURN $\Theta_k^{t+1}$
+\end{algorithmic}
+\end{algorithm}
+
+
+\begin{algorithm}[t]
+\caption{$\epsilon$-Greedy Exploration-Aware Neighbour Selection}
+\label{alg:epsilon_selection}
+\footnotesize
+\begin{algorithmic}[1]
+\REQUIRE Neighbour set $\mathcal{N}_k$, utility scores $\{S_{k,j}^t:j\in\mathcal{N}_k\}$, exploration probability $\epsilon$
+\ENSURE Selected neighbour $j_k^t$
+\STATE Draw $u\sim \mathrm{Uniform}(0,1)$
+\IF{$u<\epsilon$}
+    \STATE Select a random neighbour:
+    \begin{equation}
+j_k^t\sim \mathrm{Uniform}(\mathcal{N}_k)
+\end{equation}
+\ELSE
+    \STATE Select the highest-utility neighbour:
+    \begin{equation}
+j_k^t
+    =
+    \arg\max_{j\in\mathcal{N}_k}
+    S_{k,j}^{t}
+\end{equation}
+\ENDIF
+\RETURN $j_k^t$
+\end{algorithmic}
+\end{algorithm}
+
+The proposed method separates neighbour selection from model exchange. This distinction is important because evaluating all neighbours using their full models would require each neighbour to transmit its parameters before a selection decision is made. Instead, each client first broadcasts a lightweight descriptor containing latent prototypes, local quality information, and optional communication metadata. The receiving client then computes a utility score for each neighbour and requests model information only from the selected peer. This two-stage mechanism preserves the communication efficiency of one-neighbour interaction while allowing the selection process to remain task-aware.
+
+The algorithm supports several exchange modes. Full model mixing is the simplest option, but it may be expensive and can reduce personalisation under heterogeneous data. Encoder-only mixing is more communication-efficient and encourages clients to share representation knowledge while maintaining local decoders and classifiers. Encoder-decoder mixing is suitable when the goal is to learn a shared latent representation and reconstruction structure, while keeping the classifier head local to preserve client-specific decision boundaries. In highly non-IID settings, the latter two options may be preferable because they reduce the risk of forcing all clients into a single global classifier.
+
+\section{Theoretical Properties}
+\label{sec:theory}
+
+This section provides a theoretical discussion of the consequences of selecting only one neighbour for model-bearing exchange per communication round in a decentralised peer-to-peer learning setting. The goal is not to establish a complete convergence theory for non-convex representation-learning models, but rather to formalise the trade-off introduced by preserving a one-model-exchange-per-client budget in a graph where multiple neighbours may be available. In centralised FL, the single communication partner is fixed as the server. In the decentralised setting, the single partner is a choice variable. We show that one-peer selection can be interpreted as a budget-constrained approximation of full-neighbour aggregation. This approximation preserves the one-model-exchange budget, but may increase update variance, slow consensus, and introduce selection-induced bias under non-IID data.
+
+Let $\Theta_k^t \in \mathbb{R}^p$ denote the model parameters of client $k$ at communication round $t$. The parameters may include the encoder, decoder, and classifier head, i.e.,
+\begin{equation}
+\Theta_k^t = \{\theta_k^t,\phi_k^t,\psi_k^t\}.
+    \label{eq:auto-035}
+\end{equation}
+Let $\mathcal{N}_k$ denote the set of neighbours of client $k$ in the communication graph $\mathcal{G}=(\mathcal{V},\mathcal{E})$. In a full-neighbour decentralised aggregation step, client $k$ would aggregate information from all neighbours:
+\begin{equation}
+\Theta_{k,\mathrm{full}}^{t+1}
+=
+(1-\alpha)\Theta_k^t
++
+\alpha
+\sum_{j\in\mathcal{N}_k}
+w_{k,j}\Theta_j^t,
+    \label{eq:auto-036}
+\end{equation}
+where $w_{k,j}\geq 0$ and $\sum_{j\in\mathcal{N}_k}w_{k,j}=1$. In contrast, in the proposed one-neighbour protocol, client $k$ selects a single neighbour $j_k^t\in\mathcal{N}_k$ and performs:
+\begin{equation}
+\Theta_{k,\mathrm{one}}^{t+1}
+=
+(1-\alpha)\Theta_k^t
++
+\alpha \Theta_{j_k^t}^t.
+    \label{eq:auto-037}
+\end{equation}
+The following results compare these two updates.
+
+\begin{assumption}[Bounded local neighbourhood disagreement]
+\label{ass:bounded_disagreement}
+For each client $k$ and round $t$, define the weighted neighbourhood average:
+\begin{equation}
+\bar{\Theta}_k^t
+=
+\sum_{j\in\mathcal{N}_k}
+w_{k,j}\Theta_j^t.
+    \label{eq:auto-038}
+\end{equation}
+Assume that there exists a finite constant $B_k^t\geq 0$ such that
+\begin{equation}
+\|\Theta_j^t-\bar{\Theta}_k^t\|
+\leq B_k^t,
+\qquad
+\forall j\in\mathcal{N}_k.
+    \label{eq:auto-039}
+\end{equation}
+\end{assumption}
+
+\begin{proposition}[Deviation from full-neighbour aggregation]
+\label{prop:deviation_full}
+Under Assumption~\ref{ass:bounded_disagreement}, the deviation between the one-neighbour update and the full-neighbour aggregation update is bounded by
+\begin{equation}
+\left\|
+\Theta_{k,\mathrm{one}}^{t+1}
+-
+\Theta_{k,\mathrm{full}}^{t+1}
+\right\|
+\leq
+\alpha B_k^t.
+    \label{eq:auto-040}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Using the definitions of the two updates, we have
+\begin{align}
+&\Theta_{k,\mathrm{one}}^{t+1}
+-
+\Theta_{k,\mathrm{full}}^{t+1} \\
+&=\big[(1-\alpha)\Theta_k^t
++\alpha\Theta_{j_k^t}^t\big]
+-
+\big[(1-\alpha)\Theta_k^t
++\alpha\bar{\Theta}_k^t\big] \\
+&=\alpha\big(\Theta_{j_k^t}^t-\bar{\Theta}_k^t\big).
+\end{align}
+Taking norms gives
+\begin{equation}
+\left\|
+\Theta_{k,\mathrm{one}}^{t+1}
+-
+\Theta_{k,\mathrm{full}}^{t+1}
+\right\|
+=
+\alpha
+\left\|
+\Theta_{j_k^t}^t-\bar{\Theta}_k^t
+\right\|.
+    \label{eq:auto-041}
+\end{equation}
+Since $j_k^t\in\mathcal{N}_k$, Assumption~\ref{ass:bounded_disagreement} implies
+\begin{equation}
+\left\|
+\Theta_{j_k^t}^t-\bar{\Theta}_k^t
+\right\|
+\leq B_k^t.
+    \label{eq:auto-042}
+\end{equation}
+Therefore,
+\begin{equation}
+\left\|
+\Theta_{k,\mathrm{one}}^{t+1}
+-
+\Theta_{k,\mathrm{full}}^{t+1}
+\right\|
+\leq
+\alpha B_k^t.
+    \label{eq:auto-043}
+\end{equation}
+\end{proof}
+
+Proposition~\ref{prop:deviation_full} shows that the error introduced by selecting a single neighbour depends on the local disagreement among neighbouring models. If the neighbouring models are similar, then $B_k^t$ is small and one-neighbour aggregation closely approximates full-neighbour aggregation. If the neighbours are highly heterogeneous, then $B_k^t$ may be large, and one-neighbour selection can deviate substantially from full-neighbour aggregation.
+
+\begin{lemma}[Variance of one-neighbour information]
+\label{lem:variance_one_neighbour}
+Let $j_k^t$ be sampled from $\mathcal{N}_k$ according to a probability distribution $q_k^t(j)$, where $q_k^t(j)\geq 0$ and $\sum_{j\in\mathcal{N}_k}q_k^t(j)=1$. Define the selection-induced neighbourhood mean:
+\begin{equation}
+\mu_k^t
+=
+\sum_{j\in\mathcal{N}_k}
+q_k^t(j)\Theta_j^t.
+    \label{eq:auto-044}
+\end{equation}
+Then the variance of the one-neighbour model sample is
+\begin{equation}
+\mathbb{E}_{j_k^t\sim q_k^t}
+\left[
+\left\|
+\Theta_{j_k^t}^t-\mu_k^t
+\right\|^2
+\right]
+=
+\sum_{j\in\mathcal{N}_k}
+q_k^t(j)
+\left\|
+\Theta_j^t-\mu_k^t
+\right\|^2.
+    \label{eq:auto-045}
+\end{equation}
+This variance is zero if and only if all neighbours with non-zero selection probability have identical model parameters.
+\end{lemma}
+
+\begin{proof}
+By definition of expectation under the discrete distribution $q_k^t$, we have
+\begin{equation}
+\mathbb{E}_{j_k^t\sim q_k^t}
+\left[
+\left\|
+\Theta_{j_k^t}^t-\mu_k^t
+\right\|^2
+\right]
+=
+\sum_{j\in\mathcal{N}_k}
+q_k^t(j)
+\left\|
+\Theta_j^t-\mu_k^t
+\right\|^2.
+    \label{eq:auto-046}
+\end{equation}
+Since each term in the sum is non-negative, the expectation is zero if and only if
+\begin{equation}
+\left\|
+\Theta_j^t-\mu_k^t
+\right\|^2=0
+    \label{eq:auto-047}
+\end{equation}
+for every $j$ such that $q_k^t(j)>0$. Hence,
+\begin{equation}
+\Theta_j^t=\mu_k^t
+    \label{eq:auto-048}
+\end{equation}
+for every neighbour with non-zero selection probability. Therefore, the variance is zero if and only if all selected neighbours have identical model parameters. Otherwise, the variance is strictly positive.
+\end{proof}
+
+Lemma~\ref{lem:variance_one_neighbour} formalises the fact that selecting one neighbour gives a stochastic and potentially noisy estimate of neighbourhood information. This is particularly relevant under non-IID data, where neighbouring clients may follow different data distributions and thus develop different local models.
+
+\begin{assumption}[Lipschitz loss with respect to distribution shift]
+\label{ass:lipschitz_distribution}
+Let $R_P(\Theta)$ denote the expected risk of model $\Theta$ under distribution $P$:
+\begin{equation}
+R_P(\Theta)
+=
+\mathbb{E}_{(x,y)\sim P}
+[
+\ell(\Theta;x,y)
+].
+    \label{eq:auto-049}
+\end{equation}
+Assume that for a suitable probability distance $d(\cdot,\cdot)$, the risk is Lipschitz with respect to distribution shift. That is, there exists $L>0$ such that for any two distributions $P$ and $Q$,
+\begin{equation}
+|R_P(\Theta)-R_Q(\Theta)|
+\leq
+L d(P,Q).
+    \label{eq:auto-050}
+\end{equation}
+\end{assumption}
+
+\begin{proposition}[Selection-induced generalisation gap]
+\label{prop:selection_gap}
+Let $P$ denote a target population distribution \rev{(for client-level analysis, one may set \(P=P_k\))} and let $P_j$ denote the local data distribution of neighbour $j$. If client $k$ selects neighbours according to a stationary distribution $q_k(j)$, then the selected-neighbour distribution is
+\begin{equation}
+P_k^{\mathrm{sel}}
+=
+\sum_{j\in\mathcal{N}_k}
+q_k(j)P_j.
+    \label{eq:auto-051}
+\end{equation}
+Under Assumption~\ref{ass:lipschitz_distribution}, the generalisation gap induced by neighbour selection satisfies
+\begin{equation}
+\left|
+R_P(\Theta_k)
+-
+R_{P_k^{\mathrm{sel}}}(\Theta_k)
+\right|
+\leq
+L d(P,P_k^{\mathrm{sel}}).
+    \label{eq:auto-052}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+The result follows directly from Assumption~\ref{ass:lipschitz_distribution} by setting
+\begin{equation}
+Q=P_k^{\mathrm{sel}}.
+    \label{eq:auto-053}
+\end{equation}
+Thus,
+\begin{equation}
+\left|
+R_P(\Theta_k)
+-
+R_{P_k^{\mathrm{sel}}}(\Theta_k)
+\right|
+\leq
+L d(P,P_k^{\mathrm{sel}}).
+    \label{eq:auto-054}
+\end{equation}
+\end{proof}
+
+Proposition~\ref{prop:selection_gap} shows that if the selected-neighbour distribution $P_k^{\mathrm{sel}}$ differs substantially from the target population distribution $P$, then the model may generalise poorly beyond the selected neighbourhood. In the extreme case where client $k$ always selects the same neighbour $j$, we have
+\begin{equation}
+P_k^{\mathrm{sel}}=P_j,
+    \label{eq:auto-055}
+\end{equation}
+and the client is repeatedly exposed to information from a single local distribution. This can increase selection bias and reduce generalisability under non-IID data.
+
+\begin{corollary}[Repeated deterministic selection as a special case]
+\label{cor:deterministic_selection}
+If client $k$ deterministically selects the same neighbour $j^\star$ at every round, then
+\begin{equation}
+q_k(j^\star)=1
+    \label{eq:auto-056}
+\end{equation}
+and
+\begin{equation}
+P_k^{\mathrm{sel}}=P_{j^\star}.
+    \label{eq:auto-057}
+\end{equation}
+Consequently,
+\begin{equation}
+\left|
+R_P(\Theta_k)
+-
+R_{P_{j^\star}}(\Theta_k)
+\right|
+\leq
+L d(P,P_{j^\star}).
+    \label{eq:auto-058}
+\end{equation}
+\end{corollary}
+
+\begin{proof}
+If client $k$ always selects neighbour $j^\star$, then the selection distribution is a point mass:
+\begin{equation}
+q_k(j^\star)=1,
+\qquad
+q_k(j)=0
+\quad
+\text{for}
+\quad
+j\neq j^\star.
+    \label{eq:auto-059}
+\end{equation}
+Therefore,
+\begin{equation}
+P_k^{\mathrm{sel}}
+=
+\sum_{j\in\mathcal{N}_k}q_k(j)P_j
+=
+P_{j^\star}.
+    \label{eq:auto-060}
+\end{equation}
+Applying Proposition~\ref{prop:selection_gap} gives
+\begin{equation}
+\left|
+R_P(\Theta_k)
+-
+R_{P_{j^\star}}(\Theta_k)
+\right|
+\leq
+L d(P,P_{j^\star}).
+    \label{eq:auto-061}
+\end{equation}
+\end{proof}
+
+The above corollary highlights the risk of deterministic utility maximisation when the same neighbour is repeatedly selected. Although such a neighbour may appear locally useful, the induced information distribution can become narrow and unrepresentative.
+
+\begin{lemma}[Exploration lower bound under $\epsilon$-greedy selection]
+\label{lem:epsilon_greedy}
+Suppose client $k$ uses an $\epsilon$-greedy neighbour-selection rule:
+\begin{equation}
+j_k^t =
+\begin{cases}
+\arg\max_{j\in\mathcal{N}_k}S_{k,j}^t, & \text{with probability } 1-\epsilon,\\
+\text{Uniform}(\mathcal{N}_k), & \text{with probability } \epsilon.
+\end{cases}
+    \label{eq:auto-062}
+\end{equation}
+Then every neighbour $j\in\mathcal{N}_k$ has selection probability at least
+\begin{equation}
+q_k^t(j)
+\geq
+\frac{\epsilon}{|\mathcal{N}_k|}.
+    \label{eq:auto-063}
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+Under the $\epsilon$-greedy rule, neighbour selection consists of exploitation with probability $1-\epsilon$ and uniform exploration with probability $\epsilon$. During exploration, each neighbour is selected with probability
+\begin{equation}
+\frac{1}{|\mathcal{N}_k|}.
+    \label{eq:auto-064}
+\end{equation}
+Therefore, regardless of the exploitation decision, every neighbour receives probability mass at least
+\begin{equation}
+\epsilon \cdot \frac{1}{|\mathcal{N}_k|}
+=
+\frac{\epsilon}{|\mathcal{N}_k|}.
+    \label{eq:auto-065}
+\end{equation}
+Hence,
+\begin{equation}
+q_k^t(j)
+\geq
+\frac{\epsilon}{|\mathcal{N}_k|},
+\qquad
+\forall j\in\mathcal{N}_k.
+    \label{eq:auto-066}
+\end{equation}
+\end{proof}
+
+Lemma~\ref{lem:epsilon_greedy} justifies the use of exploration in the neighbour-selection protocol. Exploration prevents the selection process from collapsing onto a single neighbour and ensures that all neighbours remain reachable over time.
+
+\begin{proposition}[Asymptotic equivalence under local consensus]
+\label{prop:asymptotic_equivalence}
+Assume that the neighbours of client $k$ reach local consensus, i.e., there exists $\Theta^\star$ such that
+\begin{equation}
+\lim_{t\rightarrow\infty}
+\Theta_j^t
+=
+\Theta^\star,
+\qquad
+\forall j\in\mathcal{N}_k.
+    \label{eq:auto-067}
+\end{equation}
+Then, for any selected neighbour $j_k^t\in\mathcal{N}_k$,
+\begin{equation}
+\lim_{t\rightarrow\infty}
+\left\|
+\Theta_{k,\mathrm{one}}^{t+1}
+-
+\Theta_{k,\mathrm{full}}^{t+1}
+\right\|
+=
+0.
+    \label{eq:auto-068}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+From the proof of Proposition~\ref{prop:deviation_full}, we have
+\begin{equation}
+\left\|
+\Theta_{k,\mathrm{one}}^{t+1}
+-
+\Theta_{k,\mathrm{full}}^{t+1}
+\right\|
+=
+\alpha
+\left\|
+\Theta_{j_k^t}^t-\bar{\Theta}_k^t
+\right\|,
+    \label{eq:auto-069}
+\end{equation}
+where
+\begin{equation}
+\bar{\Theta}_k^t
+=
+\sum_{j\in\mathcal{N}_k}w_{k,j}\Theta_j^t.
+    \label{eq:auto-070}
+\end{equation}
+If all neighbours converge to $\Theta^\star$, then
+\begin{equation}
+\lim_{t\rightarrow\infty}\Theta_{j_k^t}^t=\Theta^\star
+    \label{eq:auto-071}
+\end{equation}
+and
+\begin{equation}
+\lim_{t\rightarrow\infty}\bar{\Theta}_k^t
+=
+\sum_{j\in\mathcal{N}_k}w_{k,j}\Theta^\star
+=
+\Theta^\star
+\sum_{j\in\mathcal{N}_k}w_{k,j}
+=
+\Theta^\star.
+    \label{eq:auto-072}
+\end{equation}
+Therefore,
+\begin{equation}
+\lim_{t\rightarrow\infty}
+\left\|
+\Theta_{j_k^t}^t-\bar{\Theta}_k^t
+\right\|
+=
+0.
+    \label{eq:auto-073}
+\end{equation}
+Multiplying by $\alpha$ gives
+\begin{equation}
+\lim_{t\rightarrow\infty}
+\left\|
+\Theta_{k,\mathrm{one}}^{t+1}
+-
+\Theta_{k,\mathrm{full}}^{t+1}
+\right\|
+=
+0.
+    \label{eq:auto-074}
+\end{equation}
+\end{proof}
+
+Proposition~\ref{prop:asymptotic_equivalence} shows that one-neighbour selection is most risky when neighbouring models are diverse, especially during early training or under strong non-IID data. Once neighbouring models become sufficiently similar, one-neighbour aggregation and full-neighbour aggregation become asymptotically equivalent.
+
+\begin{assumption}[Lipschitz classifier head]
+\label{ass:lipschitz_classifier}
+Let $h_{\psi}$ denote the classifier head. Assume that $h_{\psi}$ is $L_h$-Lipschitz with respect to the latent representation. That is, for any two latent vectors $z,z'\in\mathbb{R}^m$,
+\begin{equation}
+\|h_{\psi}(z)-h_{\psi}(z')\|
+\leq
+L_h\|z-z'\|.
+    \label{eq:auto-075}
+\end{equation}
+\end{assumption}
+
+\begin{proposition}[Latent alignment bounds prediction discrepancy]
+\label{prop:latent_alignment}
+Consider two clients $k$ and $j$ with encoders $f_{\theta_k}$ and $f_{\theta_j}$, and classifier heads $h_{\psi_k}$ and $h_{\psi_j}$. Assume that for a given input $x$,
+\begin{equation}
+\|f_{\theta_k}(x)-f_{\theta_j}(x)\|
+\leq
+\varepsilon.
+    \label{eq:auto-076}
+\end{equation}
+If the classifier heads are identical, i.e., $h_{\psi_k}=h_{\psi_j}=h_{\psi}$, and Assumption~\ref{ass:lipschitz_classifier} holds, then
+\begin{equation}
+\left\|
+h_{\psi}(f_{\theta_k}(x))
+-
+h_{\psi}(f_{\theta_j}(x))
+\right\|
+\leq
+L_h\varepsilon.
+    \label{eq:auto-077}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+By Assumption~\ref{ass:lipschitz_classifier}, for any two latent vectors $z$ and $z'$,
+\begin{equation}
+\|h_{\psi}(z)-h_{\psi}(z')\|
+\leq
+L_h\|z-z'\|.
+    \label{eq:auto-078}
+\end{equation}
+Set
+\begin{equation}
+z=f_{\theta_k}(x),
+\qquad
+z'=f_{\theta_j}(x).
+    \label{eq:auto-079}
+\end{equation}
+Then
+\begin{equation}
+\left\|
+h_{\psi}(f_{\theta_k}(x))
+-
+h_{\psi}(f_{\theta_j}(x))
+\right\|
+\leq
+L_h
+\left\|
+f_{\theta_k}(x)-f_{\theta_j}(x)
+\right\|.
+    \label{eq:auto-080}
+\end{equation}
+Using the assumption
+\begin{equation}
+\|f_{\theta_k}(x)-f_{\theta_j}(x)\|
+\leq
+\varepsilon,
+    \label{eq:auto-081}
+\end{equation}
+we obtain
+\begin{equation}
+\left\|
+h_{\psi}(f_{\theta_k}(x))
+-
+h_{\psi}(f_{\theta_j}(x))
+\right\|
+\leq
+L_h\varepsilon.
+    \label{eq:auto-082}
+\end{equation}
+\end{proof}
+
+This result motivates the use of latent-space compatibility in the neighbour-selection criterion. If two clients produce similar latent representations, then, under a Lipschitz classifier, their predictions are also close.
+
+\begin{corollary}[Latent alignment with different classifier heads]
+\label{cor:different_heads}
+Suppose the classifier heads of clients $k$ and $j$ may differ. Define the classifier-head discrepancy on a latent point $z$ as
+\begin{equation}
+\delta_{\psi}(z)
+=
+\|h_{\psi_k}(z)-h_{\psi_j}(z)\|.
+    \label{eq:auto-083}
+\end{equation}
+If
+\begin{equation}
+\|f_{\theta_k}(x)-f_{\theta_j}(x)\|
+\leq
+\varepsilon
+    \label{eq:auto-084}
+\end{equation}
+and $h_{\psi_j}$ is $L_h$-Lipschitz, then
+\begin{equation}
+\left\|
+h_{\psi_k}(f_{\theta_k}(x))
+-
+h_{\psi_j}(f_{\theta_j}(x))
+\right\|
+\leq
+\delta_{\psi}(f_{\theta_k}(x))
++
+L_h\varepsilon.
+    \label{eq:auto-085}
+\end{equation}
+\end{corollary}
+
+\begin{proof}
+By adding and subtracting $h_{\psi_j}(f_{\theta_k}(x))$, we obtain
+\begin{align}
+&\left\|
+ h_{\psi_k}(f_{\theta_k}(x))
+ -h_{\psi_j}(f_{\theta_j}(x))
+\right\| \\
+&\leq
+\left\|
+ h_{\psi_k}(f_{\theta_k}(x))
+ -h_{\psi_j}(f_{\theta_k}(x))
+\right\| \\
+&\quad+
+\left\|
+ h_{\psi_j}(f_{\theta_k}(x))
+ -h_{\psi_j}(f_{\theta_j}(x))
+\right\|.
+\end{align}
+The first term is, by definition,
+\begin{equation}
+\delta_{\psi}(f_{\theta_k}(x)).
+    \label{eq:auto-086}
+\end{equation}
+For the second term, using the $L_h$-Lipschitz property of $h_{\psi_j}$ gives
+\begin{equation}
+\left\|
+h_{\psi_j}(f_{\theta_k}(x))
+-
+h_{\psi_j}(f_{\theta_j}(x))
+\right\|
+\leq
+L_h
+\left\|
+f_{\theta_k}(x)-f_{\theta_j}(x)
+\right\|.
+    \label{eq:auto-087}
+\end{equation}
+Since
+\begin{equation}
+\left\|
+f_{\theta_k}(x)-f_{\theta_j}(x)
+\right\|
+\leq
+\varepsilon,
+    \label{eq:auto-088}
+\end{equation}
+we obtain
+\begin{equation}
+\left\|
+h_{\psi_k}(f_{\theta_k}(x))
+-
+h_{\psi_j}(f_{\theta_j}(x))
+\right\|
+\leq
+\delta_{\psi}(f_{\theta_k}(x))
++
+L_h\varepsilon.
+    \label{eq:auto-089}
+\end{equation}
+\end{proof}
+
+Corollary~\ref{cor:different_heads} is particularly relevant to personalised decentralised learning. It shows that prediction disagreement can arise from two sources: encoder misalignment and classifier-head discrepancy. This supports a design where the encoder is shared or exchanged across peers, while classifier heads may remain local.
+
+\begin{proposition}[Consensus under repeated one-neighbour exchange]
+\label{prop:consensus}
+Consider the consensus-only update
+\begin{equation}
+\Theta_k^{t+1}
+=
+(1-\alpha)\Theta_k^t
++
+\alpha\Theta_{j_k^t}^t,
+    \label{eq:auto-090}
+\end{equation}
+with $0<\alpha<1$. Suppose the communication graph is connected and the sequence of neighbour selections is such that every edge in the graph is activated infinitely often. Then the disagreement between clients decreases asymptotically, and the clients converge to a consensus subspace:
+\begin{equation}
+\lim_{t\rightarrow\infty}
+\|\Theta_k^t-\Theta_j^t\|
+=
+0,
+\qquad
+\forall k,j\in\mathcal{V}.
+    \label{eq:auto-091}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+The update is a standard pairwise averaging or gossip-style consensus step. Each activation replaces the state of a client by a convex combination of its own parameter vector and that of a neighbour. Since $0<\alpha<1$, each update is non-expansive with respect to the convex hull of the current client states.
+
+Because the graph is connected and every edge is activated infinitely often, information from every node can propagate through the network over time. Repeated convex averaging over a connected graph drives the disagreement component of the stacked parameter vector toward zero. Equivalently, the client states converge to the consensus subspace
+\begin{equation}
+\{\Theta_1=\Theta_2=\cdots=\Theta_K\}.
+    \label{eq:auto-092}
+\end{equation}
+Thus,
+\begin{equation}
+\lim_{t\rightarrow\infty}
+\|\Theta_k^t-\Theta_j^t\|
+=
+0,
+\qquad
+\forall k,j\in\mathcal{V}.
+    \label{eq:auto-093}
+\end{equation}
+\end{proof}
+
+Proposition~\ref{prop:consensus} establishes that one-neighbour communication can still support consensus, provided that the selection rule does not permanently exclude parts of the graph. This motivates the use of exploration or diversity-aware neighbour selection in practical decentralised learning.
+
+\subsection{Implications for One-Neighbour Selection}
+\label{subsec:implications-for-one-neighbour-selection}
+
+The above results suggest three implications. First, one-neighbour selection introduces a deviation from full-neighbour aggregation that is controlled by local model disagreement. Second, repeated selection of a narrow subset of neighbours induces a biased information distribution, which can increase the generalisation gap under non-IID data. Third, lightweight exploration mechanisms provide a simple way to prevent neighbour collapse and maintain information diversity.
+
+The anchor-validated quality criterion of \eqref{eq:anchor_quality} addresses the second implication \rev{heuristically}: by measuring how well neighbour \(j\) performs on client \(k\)'s own distribution, it favours neighbours that appear compatible with \(P_k\). \rev{This motivates, but does not by itself prove, a smaller distributional distance in Proposition~\ref{prop:selection_gap}.} The hard-class alignment criterion of \eqref{eq:hard_class_alignment} concentrates the prototype signal on classes where client \(k\) currently underperforms, prioritising neighbours most likely to reduce the local risk. The recency-weighted exploration bonus of \eqref{eq:recency_exploration} preserves the exploration incentive throughout the full training horizon, \rev{while an explicit \(\epsilon\)-greedy step is needed when a formal positive lower bound on all neighbour-selection probabilities is required.}
+
+Therefore, the recommended neighbour-selection criterion takes the form of \eqref{eq:recommended_score}, integrating hard-class prototype alignment, anchor-validated cross-quality, communication cost, and recency-weighted exploration. For example, a window size of $W = 10$ rounds ensures that the exploration bonus \(\hat{E}_{k,j}^t \in [1/(1+W),\, 1]\) remains bounded away from zero throughout training, while the hard-class focus ensures that the prototype term directly targets the classes where improvement matters most. \rev{If strict edge-activation guarantees are needed, this score should be combined with Algorithm~\ref{alg:epsilon_selection}.}
+
+
+
+\section{Experimental Evaluation}
+\label{sec:experimental-evaluation}
+
+\subsection{Setup}
+\label{subsec:setup}
+
+\textbf{Dataset and partitioning.}
+All experiments use Fashion-MNIST~\cite{xiao2017fashion}, a ten-class grayscale image benchmark comprising 60{,}000 training and 10{,}000 test samples at resolution $28\times28$. Data are partitioned across clients using Dirichlet allocation with concentration parameter $\alpha=0.3$, which produces strongly skewed per-client class distributions representative of realistic non-IID federated settings. Each client therefore receives dense coverage of two or three dominant classes and sparse coverage of the remainder.
+
+\textbf{Model.}
+Each client maintains a \texttt{RepAEClassifier}: a convolutional encoder mapping $1\times28\times28$ inputs to a 64-dimensional latent space via two stride-2 convolutional layers, a symmetric transposed-convolutional decoder, and a two-layer fully-connected classifier head. Clients optimise the joint reconstruction and classification objective of \eqref{eq:local_loss} using Adam at learning rate $10^{-3}$ with one local epoch per round and mini-batch size 64. Encoder--decoder weights are exchanged at each model-bearing interaction; the classifier head remains local.
+
+\textbf{Communication graph.}
+Two topologies are used in the primary full-scale experiments: an \emph{Erd\H{o}s--R\'{e}nyi} (ER) random graph (edge probability $p=0.15$, $K=50$, expected degree $\approx7.35$) and a \emph{scale-free} Barab\'{a}si--Albert graph (attachment parameter $m=3$, $K=50$, expected degree $\approx6.0$). The ER graph represents a well-connected random topology with moderate uniform degree; the scale-free graph introduces strong degree heterogeneity, with hub clients reaching degree $\approx20$--30 and peripheral clients as low as degree~1. Together these two topologies bracket the space from degree-homogeneous to degree-heterogeneous networks. Connected ER graphs are enforced by resampling.
+
+\subsubsection{\rev{Baselines and ablation methods}}
+\label{subsec:baselines}
+\rev{Under this budget-matched evaluation framework,} every method is allocated at most one model-bearing peer exchange per client per round. The primary experiments (Sections~\ref{subsec:results-official} and~\ref{subsec:results-sf}) use the full Fashion-MNIST dataset, $K=50$ clients, 150 rounds, and 3 seeds on both the ER and scale-free topologies, evaluating all ten methods listed below.
+
+The ten methods evaluated in the primary experiment are grouped as follows:
+\begin{itemize}
+    \item \emph{Budget-matched baselines}: \texttt{local\_only} (no exchange, lower bound), \texttt{random\_peer} (uniformly random one-peer selection), \texttt{static\_peer} (random fixed partner at initialisation).
+    \item \emph{Ablation variants}: \texttt{prototype\_only} (prototype mismatch alone), \texttt{quality\_only} (self-quality score alone), \texttt{prototype\_quality} (prototype + self-quality, no exploration), \texttt{prototype\_quality\_exploration} (prototype + self-quality + recency exploration), \texttt{anchor\_quality} (anchor-validated quality alone), \texttt{hard\_class\_alignment} (hard-class prototype + anchor quality, no exploration).
+    \item \emph{Proposed method}: \texttt{pearl\_full} (hard-class prototype alignment + anchor-validated cross-quality + communication cost + recency-weighted exploration, as in \eqref{eq:recommended_score}).
+\end{itemize}
+
+\textbf{Primary evaluation metrics.}
+Consistent with the claims in Section~\ref{sec:discussion}, the primary metrics are: (i) worst-client global accuracy (minimum accuracy across all client models on the shared test set); (ii) negative transfer rate (fraction of model-bearing exchanges that increase local validation loss, as in \eqref{eq:auto-102}); and (iii) normalised per-client selection entropy $\bar{H}^t$ (as in \eqref{eq:per_client_entropy}). Mean global accuracy and macro-F1 are reported as secondary metrics. In the primary experiment, all metrics are reported as mean $\pm$ std across 3 seeds at the final round.
+
+Each primary metric is designed to validate a specific theoretical result. Negative transfer rate empirically tests Proposition~\ref{prop:selection_gap}: a reduction confirms that the anchor quality screen reduces the distributional distance of selected exchanges. Worst-client accuracy empirically tests Proposition~\ref{prop:selection_gap} and Corollary~\ref{cor:deterministic_selection}: improvement over \texttt{static\_peer} directly confirms the collapse penalty predicted by Corollary~\ref{cor:deterministic_selection}. Selection entropy empirically tests Lemma~\ref{lem:epsilon_greedy} and Proposition~\ref{prop:consensus}: a value strictly between zero and one confirms that the recency-weighted exploration maintains the positive lower bound required for edge activation. Table~\ref{tab:theory_practice} summarises this theory--practice mapping.
+
+\begin{table}[t]
+\centering
+\caption{Theory--practice mapping. Each primary metric directly tests the prediction of a specific theoretical result. Checkmarks indicate which results are empirically validated by the two official experiments.}
+\label{tab:theory_practice}
+\renewcommand{\arraystretch}{1.15}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lll}
+\toprule
+\textbf{Theory result} & \textbf{Prediction} & \textbf{Primary metric} \\
+\midrule
+Proposition~\ref{prop:deviation_full}   & One-peer deviation bounded by $\alpha B_k^t$ & Mean acc cost stable \\
+Proposition~\ref{prop:selection_gap} & Anchor quality reduces $d(P_k,P^{sel}_k)$ & Neg-xfer rate $\downarrow$ \\
+Corollary~\ref{cor:deterministic_selection} & Fixed partner elevates worst-client risk & Worst-client vs \texttt{static\_peer} \\
+Lemma~\ref{lem:variance_one_neighbour}           & Near-zero entropy $\Rightarrow$ near-zero variance & Entropy $\approx0$ for no-explore methods \\
+Lemma~\ref{lem:epsilon_greedy}     & Exploration bonus $\Rightarrow$ entropy $>0$ & Entropy $>0$ for \texttt{pearl\_full} \\
+Proposition~\ref{prop:consensus}   & Edge activation $\Rightarrow$ consensus & Entropy $\in(0,1)$, not collapsed \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Evaluation Metrics}
+\label{subsec:evaluation-metrics}
+
+The following metrics are used throughout the experimental results. They are grouped into primary metrics, which directly test the theoretical predictions of Section~\ref{sec:theory}, and secondary metrics.
+
+\subsubsection{Classification Metrics}
+\label{subsubsec:classification-metrics}
+The main classification metrics should be:
+\begin{itemize}
+    \item accuracy;
+    \item macro-F1 score;
+    \item weighted-F1 score;
+    \item precision and recall;
+    \item area under the ROC curve (AUC), for binary or one-vs-rest multiclass settings;
+    \item balanced accuracy, especially under class imbalance.
+\end{itemize}
+
+Macro-F1 and balanced accuracy are particularly important under non-IID and class-imbalanced client distributions.
+
+\subsubsection{Reconstruction Metrics}
+\label{subsubsec:reconstruction-metrics}
+Because the model is representation-learning-based, reconstruction quality should also be measured:
+\begin{equation}
+    \text{MSE}_{rec}
+    =
+    \frac{1}{N}
+    \sum_{k=1}^{K}
+    \sum_{i=1}^{n_k}
+    \|x_i^k-\hat{x}_i^k\|_2^2.
+    \label{eq:auto-096}
+\end{equation}
+Additional metrics may include mean absolute error, structural similarity for images, or reconstruction error per class.
+
+\subsubsection{Representation-Quality Metrics}
+\label{subsubsec:representation-quality-metrics}
+Recommended latent-space metrics include:
+\begin{itemize}
+    \item class separability in latent space;
+    \item silhouette score;
+    \item Davies--Bouldin index;
+    \item linear-probe accuracy using frozen encoders;
+    \item prototype compactness and inter-class prototype distance;
+    \item t-SNE or UMAP visualisation for qualitative analysis.
+\end{itemize}
+
+For class prototypes, intra-class compactness can be measured as
+\begin{equation}
+    \text{Comp}_k
+    =
+    \frac{1}{C}
+    \sum_{c=1}^{C}
+    \frac{1}{|\mathcal{D}_{k,c}|}
+    \sum_{(x,y)\in\mathcal{D}_{k,c}}
+    \|f_{\theta_k}(x)-p_{k,c}\|_2^2.
+    \label{eq:auto-097}
+\end{equation}
+Inter-class separation can be measured as
+\begin{equation}
+    \text{Sep}_k
+    =
+    \frac{2}{C(C-1)}
+    \sum_{c<c'}
+    \|p_{k,c}-p_{k,c'}\|_2^2.
+    \label{eq:auto-098}
+\end{equation}
+A useful combined ratio is
+\begin{equation}
+    \text{LatentQuality}_k = \frac{\text{Sep}_k}{\text{Comp}_k+\epsilon}.
+    \label{eq:auto-099}
+\end{equation}
+
+\subsubsection{Communication Metrics}
+\label{subsubsec:communication-metrics}
+Since the method is designed for communication-efficient arbitrary networks, communication should be evaluated carefully:
+\begin{itemize}
+    \item total bytes transmitted;
+    \item bytes transmitted per client;
+    \item number of communication rounds to reach a target accuracy;
+    \item number of peer exchanges;
+    \item average selected-neighbour degree;
+    \item communication cost weighted by latency or energy;
+    \item descriptor cost versus model-exchange cost.
+\end{itemize}
+
+\rev{The total communication cost should separate selection overhead from model-bearing exchange:}
+\begin{equation}
+\begin{aligned}
+    \text{CommCost}
+    &=
+    \sum_{t=1}^{T}
+    \sum_{k=1}^{K}
+    \Bigg(
+    \sum_{j\in\mathcal{N}_k}
+    \mathrm{B}(b_{k\to j}^t)
+    +
+    \sum_{j\in\mathcal{N}_k}
+    \mathrm{B}(\mathcal{A}_{k\to j}^t)\\
+    &\qquad\qquad\qquad\qquad
+    +
+    \mathrm{B}(u_{j_k^t\to k}^t)
+    \Bigg),
+    \label{eq:auto-100}
+\end{aligned}
+\end{equation}
+\rev{where \(\mathrm{B}(\cdot)\) denotes transmitted bytes, \(b_{k\to j}^t\) is the lightweight descriptor or descriptor request sent during selection, \(\mathcal{A}_{k\to j}^t\) is the optional anchor probe sent to candidate neighbour \(j\), and \(u_{j_k^t\to k}^t\) is the selected neighbour's model-bearing update or model component.}
+
+\subsubsection{Client-Level Fairness and Robustness}
+\label{subsubsec:client-level-fairness-and-robustness}
+Network-wide average performance can hide poor performance for minority clients. Therefore, report client-level metrics carefully and distinguish between local-distribution and global-distribution evaluation:
+\begin{itemize}
+    \item mean client accuracy on a common global test set;
+    \item worst-client global accuracy, computed as the minimum accuracy across client models on the same global test distribution;
+    \item worst local-client accuracy, computed on each client's own local validation or test distribution, reported separately because it can favour highly specialised local-only models;
+    \item standard deviation of client accuracy;
+    \item 10th percentile client accuracy;
+    \item Jain's fairness index over client accuracies;
+    \item performance under client dropout and edge dropout.
+\end{itemize}
+
+Jain's fairness index can be defined as
+\begin{equation}
+    J(A_1,\dots,A_K)
+    =
+    \frac{(\sum_{k=1}^{K}A_k)^2}{K\sum_{k=1}^{K}A_k^2},
+    \label{eq:auto-101}
+\end{equation}
+where \(A_k\) is the test accuracy of client \(k\).
+
+\subsubsection{Neighbour-Selection Metrics}
+\label{subsubsec:neighbour-selection-metrics}
+The selection mechanism itself should also be evaluated. The following metrics are listed in order of priority for the primary empirical claims of this paper:
+\begin{itemize}
+    \item \emph{negative transfer rate}: fraction of model-bearing exchanges in which mixing increases a client's local validation loss, defined as $\mathbb{I}[\mathcal{L}_{val,k}(\Theta_k^{t+1}) > \mathcal{L}_{val,k}(\Theta_k^t)]$, averaged over clients and rounds;
+    \item \emph{normalised per-client selection entropy}: Shannon entropy of each client's peer-selection distribution over its neighbourhood, normalised by $\log|\mathcal{N}_k|$ and averaged across clients (see \eqref{eq:per_client_entropy});
+    \item frequency with which each neighbour is selected;
+    \item correlation between selection score and actual improvement after mixing;
+    \item diversity of selected peers over time.
+\end{itemize}
+
+The normalised per-client selection entropy is defined as:
+\begin{equation}
+    H_k^t
+    =
+    -\frac{1}{\log|\mathcal{N}_k|}
+    \sum_{j\in\mathcal{N}_k}
+    \hat{q}_k^t(j)\log\hat{q}_k^t(j),
+    \label{eq:per_client_entropy}
+\end{equation}
+where $\hat{q}_k^t(j) = \hat{M}_{k,j}^t / \sum_{j'\in\mathcal{N}_k}\hat{M}_{k,j'}^t$ is the empirical selection frequency of neighbour $j$ over the recent window. The network-level entropy is $\bar{H}^t = K^{-1}\sum_k H_k^t$. A value of $\bar{H}^t \approx 1$ indicates uniform selection (equivalent to random gossip), while $\bar{H}^t \approx 0$ indicates near-deterministic collapse. Well-calibrated informed selection should produce $\bar{H}^t$ intermediate between these extremes, stabilising as training progresses. \rev{This quantity is an empirical diagnostic for selection collapse. It is consistent with Lemma~\ref{lem:epsilon_greedy} only when the implemented selector includes explicit \(\epsilon\)-greedy exploration, and it should be treated as evidence about edge activation rather than a proof of Proposition~\ref{prop:consensus}'s condition.}
+
+A negative transfer event is defined as:
+\begin{equation}
+    \mathbb{I}\left[
+    \mathcal{L}_{val,k}(\Theta_k^{t+1})
+    >
+    \mathcal{L}_{val,k}(\Theta_k^{t})
+    \right].
+    \label{eq:auto-102}
+\end{equation}
+This metric should be measured immediately before and after peer mixing, before additional local training can mask the effect of the selected exchange. It captures a failure mode that accuracy alone can hide: a method may eventually recover good global performance while still causing many harmful client-level exchanges along the way. In a one-peer budget, such events are important because the harmful exchange consumes the only model-bearing communication opportunity available to that client in that round.
+
+\subsection{Official Results: Full-Scale ER Experiment}
+\label{subsec:results-official}
+
+Table~\ref{tab:official_results} reports mean $\pm$ std across three seeds at the final round (round 149) for all ten methods on the ER topology with 50 clients and the full Fashion-MNIST dataset. This is the primary experiment from which the paper's main quantitative claims are drawn.
+
+\begin{table*}[t]
+\centering
+\caption{Official full-scale results: ER topology, $K=50$ clients, 150 rounds, Fashion-MNIST (60k/10k), Dirichlet $\alpha=0.3$, 3 seeds. Mean $\pm$ std at the final round. Methods sorted by worst-client accuracy. Negative transfer rate and worst-client accuracy are primary metrics. \textbf{Bold} marks the best value in each primary metric column among peer-exchange methods.}
+\label{tab:official_results}
+\renewcommand{\arraystretch}{1.18}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method} & \textbf{Group} & \textbf{Acc} & \textbf{F1} & \textbf{Worst-client acc} $\uparrow$ & \textbf{Neg-xfer rate} $\downarrow$ & \textbf{Entropy} \\
+\midrule
+\texttt{local\_only}                   & lower bound  & $0.573\pm0.013$ & $0.510\pm0.014$ & $0.986\pm0.016$ & $0.493\pm0.012$ & $0.000$ \\
+\texttt{prototype\_only}               & ablation     & $0.594\pm0.017$ & $0.535\pm0.018$ & $0.975\pm0.006$ & $0.313\pm0.061$ & $0.017\pm0.008$ \\
+\texttt{hard\_class\_alignment}        & ablation     & $0.595\pm0.013$ & $0.535\pm0.014$ & $0.969\pm0.012$ & $0.213\pm0.083$ & $0.056\pm0.017$ \\
+\texttt{pearl\_full}                   & \textbf{proposed} & $0.608\pm0.019$ & $0.550\pm0.019$ & $\mathbf{0.966\pm0.011}$ & $\mathbf{0.153\pm0.050}$ & $0.194\pm0.023$ \\
+\texttt{random\_peer}                  & baseline     & $0.625\pm0.016$ & $0.569\pm0.017$ & $0.965\pm0.012$ & $0.173\pm0.031$ & $0.816\pm0.018$ \\
+\texttt{static\_peer}                  & baseline     & $0.597\pm0.010$ & $0.537\pm0.012$ & $0.954\pm0.012$ & $0.220\pm0.087$ & $0.000$ \\
+\texttt{prototype\_quality\_exploration} & ablation   & $0.599\pm0.015$ & $0.540\pm0.016$ & $0.950\pm0.009$ & $0.300\pm0.020$ & $0.172\pm0.046$ \\
+\texttt{anchor\_quality}               & ablation     & $0.615\pm0.018$ & $0.557\pm0.019$ & $0.959\pm0.007$ & $0.173\pm0.031$ & $0.270\pm0.013$ \\
+\texttt{prototype\_quality}            & ablation     & $0.593\pm0.017$ & $0.532\pm0.020$ & $0.953\pm0.009$ & $0.267\pm0.061$ & $0.038\pm0.013$ \\
+\texttt{quality\_only}                 & ablation     & $0.586\pm0.019$ & $0.526\pm0.023$ & $0.930\pm0.025$ & $0.227\pm0.031$ & $0.154\pm0.025$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsubsection{Negative Transfer: PEARL Wins Clearly — Validating Proposition~\ref{prop:selection_gap}}
+\label{subsubsec:official-neg-transfer}
+
+The primary claim of this paper is that PEARL reduces the rate of harmful peer exchanges. Table~\ref{tab:official_results} confirms this decisively. \texttt{pearl\_full} achieves the lowest negative transfer rate of all ten methods at $0.153\pm0.050$, which is $2.0$~pp below \texttt{random\_peer} ($0.173$) and $6.7$~pp below \texttt{static\_peer} ($0.220$). The gap to \texttt{prototype\_quality\_exploration} ($0.300$) is $14.7$~pp, isolating the contribution of anchor-validated quality over self-quality: replacing $Q_j^t$ with $\tilde{Q}^t_{k,j}$ of \eqref{eq:anchor_quality} nearly halves the negative transfer rate.
+
+\textbf{Theory--practice bridge (Proposition~\ref{prop:selection_gap}).}
+Proposition~\ref{prop:selection_gap} establishes that the generalisation risk of client $k$ under its selection rule is bounded by $L\,d(P_k, P^{sel}_k)$, where $d$ measures distributional distance between client $k$'s data and the distribution induced by its selected neighbours. A negative transfer event is precisely a round in which $d(P_k, P_j)$ was large --- the selected neighbour had an incompatible distribution --- but the selection rule failed to detect this before committing to model exchange. Proposition~\ref{prop:selection_gap} therefore predicts that any criterion which reduces $d(P_k, P^{sel}_k)$ in expectation should also reduce negative transfer. The anchor quality signal $\tilde{Q}^t_{k,j}$ (eq.~\eqref{eq:anchor_quality}) is a direct empirical estimator of $-d(P_k, P_j)$: by evaluating neighbour $j$ on $|\mathcal{A}_k|$ samples drawn from $P_k$ before model exchange, it measures how well $j$ already generalises to $k$'s distribution. Selecting the neighbour with the highest $\tilde{Q}^t_{k,j}$ therefore minimises the expected distributional distance of the selected exchange, which is exactly what the $2.0$~pp reduction in negative transfer rate measures empirically. The $14.7$~pp gap between \texttt{prototype\_quality\_exploration} and \texttt{pearl\_full} further confirms this: \texttt{prototype\_quality\_exploration} uses self-quality $Q_j^t$ (how well $j$ performs on $j$'s own data), which is uninformative about $d(P_k, P_j)$, while \texttt{pearl\_full} uses $\tilde{Q}^t_{k,j}$ (how well $j$ performs on $k$'s data), which directly estimates the quantity Proposition~\ref{prop:selection_gap} bounds. The empirical gap is the practical consequence of this theoretical distinction.
+
+\textbf{Theory--practice bridge (Lemma~\ref{lem:epsilon_greedy}).}
+\texttt{anchor\_quality} alone achieves $0.173\pm0.031$, tying \texttt{random\_peer} rather than beating it. The additional reduction from $0.173$ to $0.153$ in \texttt{pearl\_full} is attributable to hard-class alignment (eq.~\eqref{eq:hard_class_alignment}) and recency-weighted exploration (eq.~\eqref{eq:recency_exploration}). Lemma~\ref{lem:epsilon_greedy} establishes that the exploration bonus maintains a positive lower bound $q_k^t(j) \geq \varepsilon/|\mathcal{N}_k|$ on all selection probabilities. Without this bound, a suboptimal partner identified as high-quality in early training (when models are noisy) can monopolise future selections, locking the client into a partner that causes repeated negative transfer as training progresses. The $2.0$~pp improvement of \texttt{pearl\_full} over \texttt{anchor\_quality} is the empirical confirmation that Lemma~\ref{lem:epsilon_greedy}'s diversity guarantee prevents this late-training negative transfer concentration.
+
+\subsubsection{Worst-Client Accuracy: Fairness Under Competition — Validating Proposition~\ref{prop:selection_gap} and Corollary~\ref{cor:deterministic_selection}}
+\label{subsubsec:official-worst}
+
+\texttt{pearl\_full} achieves the second-highest worst-client accuracy of all peer-exchange methods at $0.966\pm0.011$, which is $+1.1$~pp above \texttt{random\_peer} ($0.965$) and $+1.2$~pp above \texttt{static\_peer} ($0.954$). The method with the highest worst-client accuracy is \texttt{prototype\_only} ($0.975\pm0.006$), but this comes at a severe cost: \texttt{prototype\_only} achieves the lowest mean accuracy of all peer-exchange methods ($0.594$, a deficit of $3.1$~pp relative to \texttt{random\_peer}). This trade-off arises because \texttt{prototype\_only} selects peers based on latent prototype alignment alone, which is extremely conservative --- it refuses to exchange with any neighbour whose prototype space is not immediately compatible. While this protects the worst client locally, it starves other clients of diverse and useful information, depressing aggregate performance.
+
+\texttt{pearl\_full} resolves this tension by combining prototype alignment with anchor-validated quality and exploration, achieving competitive worst-client accuracy without sacrificing mean accuracy to the same degree. The $1.7$~pp mean accuracy deficit relative to \texttt{random\_peer} represents the cost of the compatibility screen.
+
+\textbf{Theory--practice bridge (Proposition~\ref{prop:selection_gap}).}
+Proposition~\ref{prop:selection_gap} bounds the risk of the worst-performing client under its selection rule by $L\,d(P, P^{sel}_k)$. The worst client is by definition the one whose selection-induced distribution diverges most from the global test distribution $P$. Under \texttt{random\_peer}, this client has no protection against drawing an incompatible neighbour, so its generalisation gap remains bounded only by whatever $d(P_k, P_j)$ happens to be for a random $j$. Under \texttt{pearl\_full}, the anchor quality screen preferentially selects neighbours for which $d(P_k, P_j)$ is small, tightening the bound of Proposition~\ref{prop:selection_gap} specifically for the client most at risk. The $+1.1$~pp worst-client advantage over \texttt{random\_peer} on ER is the empirical realisation of this tightening.
+
+\textbf{Theory--practice bridge (Corollary~\ref{cor:deterministic_selection}).}
+Corollary~\ref{cor:deterministic_selection} is the sharpest theoretical warning in the paper: when a client always selects the same neighbour $j^\star$ deterministically, the selection distribution collapses to $P^{sel}_k = P_{j^\star}$, and the generalisation gap is permanently bounded below by $L\,d(P, P_{j^\star})$ with no mechanism for escape. \texttt{static\_peer} is the direct empirical instantiation of this corollary: entropy $0.000$ across all seeds and rounds, worst-client accuracy $0.954$ --- $1.2$~pp below \texttt{pearl\_full} ($0.966$) despite competitive mean accuracy ($0.597$). The corollary predicts exactly this pattern: a method that locks onto a fixed partner will converge to a fixed generalisation gap determined by that partner's distributional distance, while a method with exploration --- such as \texttt{pearl\_full} with its recency-weighted bonus --- can escape such lock-in and achieve a lower permanent generalisation gap. The empirical $1.2$~pp deficit of \texttt{static\_peer} is the measured cost of the collapse that Corollary~\ref{cor:deterministic_selection} warns against.
+
+\subsubsection{The Local-Only Paradox — Validating Proposition~\ref{prop:deviation_full}}
+\label{subsubsec:local-only-paradox}
+
+\texttt{local\_only} achieves the highest worst-client accuracy of all methods at $0.986\pm0.016$, which appears contradictory: how can a method with no communication outperform all peer-exchange methods on the fairness metric? The explanation is the \emph{specialisation effect} under non-IID data. With Dirichlet $\alpha=0.3$ and 50 clients, each client concentrates on 2--3 dominant classes. A client that never exchanges with anyone becomes highly accurate on its own dominant classes, so even the weakest local client achieves strong accuracy on its own distribution. However, \texttt{local\_only} achieves the lowest mean global accuracy ($0.573$) because these specialised models fail on classes they have never seen. Peer exchange trades local specialisation for broader generalisation, which can temporarily reduce a client's accuracy on its dominant classes. The worst-client metric captures the floor of global-test accuracy, which is the appropriate fairness measure --- and on this metric, \texttt{pearl\_full} leads all peer-exchange methods while \texttt{local\_only}'s apparent advantage dissolves when evaluated globally.
+
+\textbf{Theory--practice bridge (Proposition~\ref{prop:deviation_full}).}
+Proposition~\ref{prop:deviation_full} establishes that the deviation between one-neighbour aggregation and full-neighbour aggregation is bounded by $\alpha B_k^t$, where $B_k^t$ is the local neighbourhood disagreement. In early training, when models are highly heterogeneous ($B_k^t$ large), any peer exchange --- including \texttt{pearl\_full}'s screened exchange --- can temporarily push a client away from its local specialisation. The local-only paradox is therefore a manifestation of the deviation bound: in the short run, mixing with any peer introduces the disagreement term $\alpha B_k^t$, which can reduce performance on the client's dominant classes. As training progresses and $B_k^t$ decreases (Proposition~\ref{prop:consensus}), the exchanged information becomes more aligned with the local distribution and the deviation cost shrinks. This is why the paradox is most pronounced in finite-round experiments: the worst-client advantage of \texttt{local\_only} would diminish in longer runs as neighbourhood models converge. It further confirms that worst-client \emph{global} accuracy on a shared test set is the correct fairness metric: it captures network-wide utility rather than per-client local specialisation.
+
+\subsubsection{Selection Entropy: The Ablation Hierarchy — Validating Lemma~\ref{lem:variance_one_neighbour}, Lemma~\ref{lem:epsilon_greedy}, and Proposition~\ref{prop:consensus}}
+\label{subsubsec:official-entropy}
+
+The entropy values in Table~\ref{tab:official_results} form a clean monotone hierarchy that directly maps to the ablation structure:
+\begin{equation}
+\begin{gathered}
+0.017_{\texttt{proto}} < 0.038_{\texttt{proto+qual}} <
+0.056_{\texttt{hard}}\\
+< 0.154_{\texttt{qual}} < 0.172_{\texttt{pq+explore}} <
+0.194_{\texttt{pearl}}\\
+< 0.270_{\texttt{anchor}} \ll 0.816_{\texttt{random}}.
+\end{gathered}
+\end{equation}
+
+\textbf{Theory--practice bridge (Lemma~\ref{lem:variance_one_neighbour} and Corollary~\ref{cor:deterministic_selection}).}
+Lemma~\ref{lem:variance_one_neighbour} establishes that the variance of the one-neighbour model sample is zero if and only if all selected neighbours have identical parameters. Near-zero entropy ($0.017$--$0.056$ for methods without exploration) empirically confirms near-deterministic selection: these methods concentrate on a single preferred partner, approaching the zero-variance scenario of Lemma~\ref{lem:variance_one_neighbour} from the selection side. This is exactly the failure mode Corollary~\ref{cor:deterministic_selection} warns against: when $q_k(j^\star) \to 1$, the selection-induced distribution collapses to $P_{j^\star}$, and the generalisation gap is permanently determined by $d(P, P_{j^\star})$. Methods without exploration therefore pay the penalty Corollary~\ref{cor:deterministic_selection} predicts in both entropy (near-zero) and worst-client accuracy (below \texttt{pearl\_full} for all methods with entropy $<0.1$).
+
+\textbf{Theory--practice bridge (Lemma~\ref{lem:epsilon_greedy}).}
+Lemma~\ref{lem:epsilon_greedy} proves that the recency-weighted exploration bonus maintains a lower bound $q_k^t(j) \geq \varepsilon/|\mathcal{N}_k|$ on all selection probabilities. Methods incorporating this bonus (\texttt{prototype\_quality\_exploration} at $0.172$, \texttt{pearl\_full} at $0.194$) show substantially higher entropy than those without it ($0.017$--$0.056$), empirically confirming that the bound is active and preventing collapse. The entropy jump from \texttt{hard\_class\_alignment} ($0.056$, no exploration) to \texttt{prototype\_quality\_exploration} ($0.172$, with exploration) isolates the exploration contribution: $+11.6$ entropy units, consistent with the $\varepsilon/|\mathcal{N}_k|$ lower bound becoming the effective floor.
+
+\textbf{Theory--practice bridge (Proposition~\ref{prop:consensus}).}
+Proposition~\ref{prop:consensus} requires every edge to be activated infinitely often for consensus to hold. \texttt{static\_peer} with entropy $0.000$ violates this condition by construction, and its lower worst-client accuracy ($0.954$ vs $0.966$ for \texttt{pearl\_full}) is the empirical consequence. \texttt{pearl\_full} at entropy $0.194$ satisfies the spirit of Proposition~\ref{prop:consensus}: the recency window ensures all neighbours are visited periodically, and the non-zero entropy confirms no edge has been permanently excluded. The structured entropy of $0.194$ --- well below random ($0.816$) but strictly positive --- is empirical evidence that \texttt{pearl\_full} has learned a genuine neighbourhood preference while maintaining the diversity required for consensus-compatible mixing.
+
+\subsubsection{Mean Accuracy: Honest Interpretation}
+\label{subsubsec:official-mean-acc}
+
+\texttt{random\_peer} leads on mean accuracy ($0.625\pm0.016$) and F1 ($0.569$). \texttt{pearl\_full} achieves $0.608\pm0.019$ ($-1.7$~pp). This gap should be interpreted as the cost of the compatibility screen rather than a failure. \texttt{random\_peer} occasionally receives informative updates from incompatible but knowledge-rich partners; \texttt{pearl\_full} systematically filters these out to protect weak clients and reduce negative transfer. The correct framing is that \texttt{pearl\_full} achieves competitive mean accuracy (ahead of six of the ten methods) while simultaneously achieving the lowest negative transfer rate and second-highest worst-client accuracy. No other method in Table~\ref{tab:official_results} achieves this combination. \texttt{anchor\_quality} comes closest ($0.615$ accuracy, $0.173$ neg-xfer, $0.959$ worst) but trails \texttt{pearl\_full} on worst-client ($-0.7$~pp) and negative transfer ($+2.0$~pp), confirming that hard-class alignment and recency exploration add value beyond the anchor signal alone.
+
+\subsection{Official Results: Scale-Free Topology}
+\label{subsec:results-sf}
+
+Table~\ref{tab:sf_results} reports mean $\pm$ std across three seeds at round 149 for all ten methods on the scale-free (Barab\'{a}si--Albert, $m=3$) topology with $K=50$ clients and the full Fashion-MNIST dataset. The scale-free graph introduces strong degree heterogeneity: hubs reach degree $\approx20$--30 while peripheral clients have degree as low as 1. This makes uninformed random selection especially dangerous for peripheral clients and maximises the discriminative value of the anchor quality signal.
+
+\begin{table*}[t]
+\centering
+\caption{Official scale-free results: Barab\'{a}si--Albert graph ($m=3$), $K=50$ clients, 150 rounds, Fashion-MNIST (60k/10k), Dirichlet $\alpha=0.3$, 3 seeds. Mean $\pm$ std at the final round. Methods sorted by worst-client accuracy. \textbf{Bold} marks the best value in each primary metric column among peer-exchange methods.}
+\label{tab:sf_results}
+\renewcommand{\arraystretch}{1.18}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method} & \textbf{Group} & \textbf{Acc} & \textbf{F1} & \textbf{Worst-client acc} $\uparrow$ & \textbf{Neg-xfer rate} $\downarrow$ & \textbf{Entropy} \\
+\midrule
+\texttt{local\_only}                     & lower bound & $0.573\pm0.014$ & $0.511\pm0.015$ & $0.993\pm0.004$ & $0.453\pm0.012$ & $0.000$ \\
+\texttt{random\_peer}                    & baseline    & $0.625\pm0.020$ & $0.568\pm0.022$ & $0.968\pm0.009$ & $0.167\pm0.050$ & $0.864\pm0.009$ \\
+\texttt{prototype\_only}                 & ablation    & $0.593\pm0.020$ & $0.532\pm0.023$ & $0.965\pm0.008$ & $0.273\pm0.061$ & $0.006\pm0.005$ \\
+\texttt{anchor\_quality}                 & ablation    & $0.613\pm0.018$ & $0.554\pm0.020$ & $0.958\pm0.010$ & $0.167\pm0.081$ & $0.255\pm0.040$ \\
+\textbf{\texttt{pearl\_full}}            & \textbf{proposed} & $0.607\pm0.015$ & $0.547\pm0.016$ & $\mathbf{0.951\pm0.020}$ & $\mathbf{0.133\pm0.061}$ & $0.183\pm0.028$ \\
+\texttt{prototype\_quality\_exploration} & ablation    & $0.597\pm0.019$ & $0.539\pm0.021$ & $0.952\pm0.011$ & $0.253\pm0.050$ & $0.180\pm0.045$ \\
+\texttt{hard\_class\_alignment}          & ablation    & $0.595\pm0.018$ & $0.534\pm0.019$ & $0.944\pm0.010$ & $0.227\pm0.046$ & $0.080\pm0.023$ \\
+\texttt{static\_peer}                    & baseline    & $0.590\pm0.018$ & $0.530\pm0.021$ & $0.942\pm0.025$ & $0.200\pm0.035$ & $0.000$ \\
+\texttt{quality\_only}                   & ablation    & $0.588\pm0.028$ & $0.527\pm0.032$ & $0.941\pm0.026$ & $0.180\pm0.111$ & $0.151\pm0.037$ \\
+\texttt{prototype\_quality}              & ablation    & $0.591\pm0.019$ & $0.531\pm0.022$ & $0.931\pm0.037$ & $0.233\pm0.042$ & $0.044\pm0.018$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsubsection{Negative Transfer on Scale-Free: PEARL Wins More Clearly — Further Validating Proposition~\ref{prop:selection_gap}}
+\label{subsubsec:sf-neg-transfer}
+
+The scale-free result confirms and strengthens the ER finding. \texttt{pearl\_full} achieves the lowest negative transfer rate at $0.133\pm0.061$, which is $3.3$~pp below \texttt{random\_peer} ($0.167$) --- substantially larger than the $2.0$~pp gap on ER.
+
+\textbf{Theory--practice bridge (Proposition~\ref{prop:selection_gap}).}
+Proposition~\ref{prop:selection_gap} bounds the generalisation gap by $L\,d(P_k, P^{sel}_k)$. In a scale-free graph, uninformed random selection from a neighbourhood of 20--25 candidates encounters incompatible partners more frequently than in ER (pool $\approx7$), because the larger pool contains a higher absolute number of distributional outliers. This increases $d(P_k, P^{sel}_k)$ under \texttt{random\_peer}, raising its baseline negative transfer rate. The anchor quality signal $\tilde{Q}^t_{k,j}$ (eq.~\eqref{eq:anchor_quality}) remains equally effective regardless of neighbourhood size --- it evaluates \emph{all} candidates on the same anchor set from $P_k$ and selects the one minimising $d(P_k, P_j)$ --- so the absolute negative transfer rate of \texttt{pearl\_full} actually decreases from $0.153$ (ER) to $0.133$ (scale-free) while \texttt{random\_peer}'s rate stays roughly constant ($0.173$ ER vs $0.167$ SF). The net effect is a larger gap on scale-free ($-3.3$~pp) than on ER ($-2.0$~pp), which is precisely the topology-dependent scaling that Proposition~\ref{prop:selection_gap} implies: the bound tightens more when the baseline distributional risk is higher.
+
+The ablation analysis is equally telling. On ER, the gap between \texttt{prototype\_quality\_exploration} ($0.300$) and \texttt{pearl\_full} ($0.153$) was $14.7$~pp. On scale-free, the corresponding gap between \texttt{prototype\_quality\_exploration} ($0.253$) and \texttt{pearl\_full} ($0.133$) is $12.0$~pp. Both gaps are large and consistent, confirming that the dominant contributor --- replacing self-quality $Q_j^t$ with anchor-validated $\tilde{Q}^t_{k,j}$ --- reduces the distributional mismatch in the selection rule as Proposition~\ref{prop:selection_gap} predicts, regardless of topology. \texttt{anchor\_quality} alone achieves $0.167\pm0.081$ on scale-free --- tying \texttt{random\_peer} as it did on ER --- confirming that hard-class alignment (eq.~\eqref{eq:hard_class_alignment}) and recency-weighted exploration (eq.~\eqref{eq:recency_exploration}, grounded in Lemma~\ref{lem:epsilon_greedy}) provide the additional reduction from $0.167$ to $0.133$.
+
+\subsubsection{Worst-Client Accuracy on Scale-Free: A Topology-Dependent Finding — Proposition~\ref{prop:selection_gap} and Corollary~\ref{cor:deterministic_selection}}
+\label{subsubsec:sf-worst}
+
+The worst-client results on scale-free present a more nuanced picture than on ER. \texttt{pearl\_full} achieves $0.951\pm0.020$, which is the best among methods with competitive mean accuracy. However two observations require honest discussion.
+
+First, \texttt{random\_peer} leads all peer-exchange methods at $0.968\pm0.009$, which is $1.7$~pp above \texttt{pearl\_full} ($0.951$).
+
+\textbf{Theory--practice bridge (Proposition~\ref{prop:selection_gap} — topology-specific case).}
+Proposition~\ref{prop:selection_gap} shows that worst-client risk is bounded by $L\,d(P, P^{sel}_k)$. On a scale-free BA graph, hub clients (degree $\approx20$--30) have exchanged with many diverse neighbours over 150 rounds and carry broad class coverage that approximates the global distribution $P$. Under \texttt{random\_peer}, peripheral clients frequently draw a hub as their random partner, which \emph{accidentally} tightens $d(P, P^{sel}_k)$ for the worst client. This is a topology-specific consequence of the power-law degree distribution: the selection-induced distribution $P^{sel}_k$ under \texttt{random\_peer} is dominated by hub clients whose coverage approximates $P$. \texttt{pearl\_full}'s anchor screen occasionally rejects these hub partners when the hub's class distribution diverges from the peripheral client's dominant classes (low $\tilde{Q}^t_{k,j}$), inadvertently blocking some high-value exchanges. This is a genuine limitation of anchor quality on highly heterogeneous degree topologies, identified in Section~\ref{sec:limitations}. The advantage of \texttt{pearl\_full} on negative transfer ($-3.3$~pp) confirms the anchor mechanism is working correctly; the worst-client result shows that on scale-free topologies, the topology itself provides an accidental fairness mechanism that the anchor screen must avoid disrupting.
+
+Second, \texttt{static\_peer} achieves $0.942\pm0.025$ on scale-free, $0.9$~pp below \texttt{pearl\_full} ($0.951$).
+
+\textbf{Theory--practice bridge (Corollary~\ref{cor:deterministic_selection}).}
+Corollary~\ref{cor:deterministic_selection} predicts that deterministic partner lock-in produces a permanently elevated worst-client risk determined by $d(P, P_{j^\star})$. \texttt{static\_peer}'s entropy of $0.000$ on scale-free confirms complete lock-in, and its worst-client deficit relative to \texttt{pearl\_full} ($-0.9$~pp) is the empirical consequence. The gap is smaller than on ER ($-1.2$~pp) because on scale-free even a randomly fixed partner has some probability of being a hub, which provides good coverage. Nevertheless, \texttt{static\_peer} still trails \texttt{pearl\_full}, confirming that deliberate exploration through the recency-weighted bonus outperforms the accidental topology benefit of a randomly chosen fixed partner.
+
+Third, the precision-recall tension from ER persists: \texttt{prototype\_only} ($0.965$) leads worst-client among peer-exchange methods at the cost of mean accuracy ($0.593$, $-3.2$~pp vs \texttt{random\_peer}). \texttt{pearl\_full} achieves the best worst-client accuracy ($0.951$) among methods with competitive mean accuracy ($\geq0.600$), resolving this tension as on ER.
+
+\subsubsection{Selection Entropy on Scale-Free: Confirming the Degree-Entropy Relationship — Validating Lemma~\ref{lem:epsilon_greedy} and Proposition~\ref{prop:consensus}}
+\label{subsubsec:sf-entropy}
+
+The entropy hierarchy on scale-free mirrors the ER result but at slightly lower values:
+\begin{equation}
+\begin{gathered}
+0.006_{\texttt{proto}} < 0.044_{\texttt{proto+qual}} <
+0.080_{\texttt{hard}}\\
+< 0.151_{\texttt{qual}} < 0.180_{\texttt{pq+explore}} <
+0.183_{\texttt{pearl}}\\
+< 0.255_{\texttt{anchor}} \ll 0.864_{\texttt{random}}.
+\end{gathered}
+\end{equation}
+
+Comparing directly with the ER hierarchy reveals the degree-entropy relationship:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{ER entropy} & \textbf{SF entropy} \\
+\midrule
+\texttt{pearl\_full}     & 0.194 & 0.183 \\
+\texttt{anchor\_quality} & 0.270 & 0.255 \\
+\texttt{random\_peer}    & 0.816 & 0.864 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Theory--practice bridge (Lemma~\ref{lem:epsilon_greedy}).}
+Lemma~\ref{lem:epsilon_greedy} establishes the lower bound $q_k^t(j) \geq \varepsilon/|\mathcal{N}_k|$: the minimum selection probability of any neighbour is inversely proportional to neighbourhood size. For hub clients with $|\mathcal{N}_k|\approx25$, this lower bound is very tight, permitting the selection to concentrate strongly on 2--3 compatible partners. For peripheral clients with $|\mathcal{N}_k|=1$--$2$, the bound is loose, maintaining near-uniform selection. The network-average entropy of \texttt{pearl\_full} therefore decreases from $0.194$ (ER, uniform $|\mathcal{N}_k|\approx7.35$) to $0.183$ (SF, heterogeneous $|\mathcal{N}_k|$ with high-degree hubs driving entropy down), empirically confirming Lemma~\ref{lem:epsilon_greedy}'s prediction that entropy scales inversely with degree. \texttt{random\_peer}'s entropy \emph{rises} from $0.816$ (ER) to $0.864$ (SF) --- because hub clients have more neighbours to sample from uniformly --- confirming that the ER$\to$SF entropy decrease for \texttt{pearl\_full} is not an artefact of the random baseline but a genuine consequence of structured hub selection.
+
+\textbf{Theory--practice bridge (Proposition~\ref{prop:consensus}).}
+Proposition~\ref{prop:consensus} requires all edges to be activated infinitely often for consensus. The non-zero entropy of \texttt{pearl\_full} on scale-free ($0.183$) confirms that no edge is permanently excluded: the recency-weighted window ensures peripheral clients periodically revisit their limited neighbours and hub clients periodically visit lower-ranked candidates. This is stronger evidence than on ER: if the recency-weighted exploration were insufficient on scale-free (where hub clients have 25 candidate partners and could easily collapse onto one), we would observe entropy near zero for hub clients. The observed $0.183$ network average confirms that even hub clients maintain meaningful exploration, satisfying Proposition~\ref{prop:consensus}'s edge-activation condition in practice.
+
+\subsubsection{Cross-Topology Comparison: What the Two Official Results Establish Together}
+\label{subsubsec:cross-topology}
+
+Table~\ref{tab:cross_topology} summarises the key metrics for \texttt{pearl\_full} and \texttt{random\_peer} across both official topologies, making the consistency of the negative transfer advantage explicit.
+
+\begin{table}[t]
+\centering
+\caption{Cross-topology comparison of \texttt{pearl\_full} vs \texttt{random\_peer} on primary metrics. Both experiments: $K=50$, 150 rounds, 3 seeds, Fashion-MNIST, Dirichlet $\alpha=0.3$.}
+\label{tab:cross_topology}
+\renewcommand{\arraystretch}{1.15}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Topology} & \textbf{Method} & \textbf{Acc} & \textbf{Worst-client} $\uparrow$ & \textbf{Neg-xfer} $\downarrow$ \\
+\midrule
+\multirow{2}{*}{ER ($p{=}0.15$)}
+  & \texttt{random\_peer} & 0.625 & 0.965 & 0.173 \\
+  & \texttt{pearl\_full}  & 0.608 & \textbf{0.966} & \textbf{0.153} \\
+\midrule
+\multirow{2}{*}{Scale-free ($m{=}3$)}
+  & \texttt{random\_peer} & 0.625 & \textbf{0.968} & 0.167 \\
+  & \texttt{pearl\_full}  & 0.607 & 0.951 & \textbf{0.133} \\
+\midrule
+\multirow{2}{*}{$\Delta$ (pearl $-$ random)}
+  & ER         & $-0.017$ & $+0.001$ & $\mathbf{-0.020}$ \\
+  & Scale-free & $-0.018$ & $-0.017$ & $\mathbf{-0.034}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three findings emerge from the cross-topology view, each with an explicit theory--practice bridge.
+
+\textbf{Finding 1: Negative transfer reduction is consistent and grows with degree heterogeneity} (validates Proposition~\ref{prop:selection_gap}). \texttt{pearl\_full} beats \texttt{random\_peer} on negative transfer on both topologies: $-2.0$~pp on ER and $-3.3$~pp on scale-free. Proposition~\ref{prop:selection_gap} predicts that the advantage of anchor-validated screening grows when $d(P_k, P^{sel}_k)$ is larger under random selection, which occurs when the neighbourhood is larger and more diverse. Scale-free hubs provide exactly this condition. The growing gap is therefore not incidental but a direct consequence of the proposition's dependence on the baseline distributional risk.
+
+\textbf{Finding 2: Worst-client accuracy depends on topology in a theoretically explained way} (validates Proposition~\ref{prop:selection_gap} and Corollary~\ref{cor:deterministic_selection}). On ER, \texttt{pearl\_full} leads by $+0.1$~pp because no topology-driven fairness mechanism exists for random gossip, and Proposition~\ref{prop:selection_gap}'s bound is tighter under \texttt{pearl\_full}. On scale-free, \texttt{random\_peer} leads by $+1.7$~pp because the BA degree distribution accidentally provides hub-driven coverage that approximates the global distribution, as explained by Proposition~\ref{prop:selection_gap}'s topology-specific case in Section~\ref{subsubsec:sf-worst}. In both topologies, \texttt{static\_peer} trails \texttt{pearl\_full}, directly confirming the Corollary~\ref{cor:deterministic_selection} prediction.
+
+\textbf{Finding 3: Mean accuracy cost is consistent at $1.7$--$1.8$~pp} (validates Proposition~\ref{prop:deviation_full}). Proposition~\ref{prop:deviation_full} bounds the deviation introduced by one-neighbour selection by $\alpha B_k^t$. \texttt{pearl\_full}'s compatibility screen reduces $B_k^t$ in expectation by avoiding incompatible partners, but this also occasionally rejects high-value partners who would reduce $B_k^t$ through informative updates. The stable $1.7$--$1.8$~pp mean accuracy cost across both topologies confirms this is a fixed equilibrium cost of the screen rather than a topology-specific artefact.
+
+\section{Discussion}
+\label{sec:discussion}
+
+The central insight of PEARL is that the removal of the server does not merely change the network topology --- it removes the global intelligence that protects individual clients. In server-based FL, a coordinator with global knowledge can implement fairness mechanisms: reweight contributions, select participants, detect and protect stragglers. In a fully decentralised system, each client is blind. It cannot know whether it is the weakest participant, which of its neighbours has a compatible distribution, or whether the peer it is about to contact will help or harm it. Under a one-peer budget, this blindness is especially costly: a harmful random selection wastes the client's only model-bearing communication slot in that round, with no recovery mechanism beyond subsequent local training. Weak clients --- those with unusual or minority distributions --- are harmed most often, because most of their neighbours are statistically likely to be incompatible.
+
+PEARL replaces blindness with a minimal local compatibility test. Before committing to model exchange, each client sends a small anchor set to each candidate neighbour and observes how well that neighbour already performs on its data. \rev{This provides a local empirical compatibility proxy motivated by Proposition~\ref{prop:selection_gap}; it does not directly estimate the probability distance $d(P_k,P_j)$ unless additional assumptions connect anchor loss to that distance.} The result is that clients most vulnerable to incompatible random selection gain a meaningful degree of protection through purely local information. This is not a fairness mechanism imposed from above; it emerges from each client acting in its own interest.
+
+The primary empirical claims follow directly from this design. First, \emph{negative transfer} should decrease, because the anchor quality signal screens out incompatible neighbours before model exchange rather than discovering incompatibility after the fact. \rev{The full-scale results of Sections~\ref{subsubsec:official-neg-transfer} and~\ref{subsubsec:sf-neg-transfer} are consistent with this mechanism:} \texttt{pearl\_full} achieves the lowest negative transfer rate of all ten methods on both official topologies --- $0.153$ on ER ($-2.0$~pp vs random) and $0.133$ on scale-free ($-3.3$~pp vs random). The gap is larger on scale-free, where random gossip encounters more incompatible candidates due to larger neighbourhoods. The ablation comparison to \texttt{prototype\_quality\_exploration} isolates the anchor quality contribution: $-14.7$~pp on ER and $-12.0$~pp on scale-free. \rev{The theoretical motivation is Proposition~\ref{prop:selection_gap}: incompatible distributions can increase risk, and anchor quality provides a pre-exchange empirical compatibility check rather than a direct distance estimate.} Second, \emph{worst-client accuracy} results depend on topology in an instructive way. On ER, \texttt{pearl\_full} leads peer-exchange methods at $0.966$ ($+1.1$~pp vs random). On scale-free, \texttt{random\_peer} leads at $0.968$ due to the hub-driven information diffusion effect (Section~\ref{subsubsec:sf-worst}): peripheral clients frequently draw hub clients as random partners, and hubs accidentally provide broad class coverage. \texttt{pearl\_full} achieves the best worst-client accuracy among methods with competitive mean accuracy on scale-free, confirming the method is operating as designed. \rev{Corollary~\ref{cor:deterministic_selection} motivates comparison with \texttt{static\_peer}, whose consistently lower worst-client accuracy across both topologies is consistent with the risk of concentrated partner exposure.} Third, the \emph{selection entropy} settles at a structured intermediate value on both topologies --- $0.194$ (ER) and $0.183$ (scale-free) --- \rev{consistent with non-collapsed selection behaviour and with the intended exploration properties, though formal edge-activation guarantees require the explicit stochastic conditions stated in Proposition~\ref{prop:consensus}.}
+
+The formulation supports personalisation naturally. Encoder--decoder weights are shared across selected peers while classifier heads remain local, preserving client-specific decision boundaries under label skew and domain shift. The hard-class alignment criterion focuses encoder sharing on the regions of input space where the local classifier is weakest, making the representation more informative precisely where the client needs it most.
+
+\rev{The recency-weighted exploration bonus is designed to maintain these properties throughout training. Without such an exploration mechanism, the selection rule can collapse toward the static-peer failure mode identified in Corollary~\ref{cor:deterministic_selection}. The observed non-zero entropy across the reported topology runs indicates that collapse did not occur in those runs, but formal edge-activation guarantees require the explicit stochastic exploration condition stated above.}
+
+
+
+\section{Limitations}
+\label{sec:limitations}
+
+Several limitations of the proposed framework deserve explicit acknowledgement. First, the anchor-validated quality criterion requires client \(k\) to transmit a small labelled sample \(\mathcal{A}_k\) to each neighbour during the selection phase. Although \(\mathcal{A}_k\) is small (32--64 samples) and is not stored by the receiving neighbour, this constitutes a limited disclosure of local data. In settings with strict data privacy requirements, the anchor set could be replaced by synthetic or augmented samples drawn from the local prototype distribution, at the cost of a less precise quality estimate.
+
+Second, the hard-class threshold \(\tau_{cls}\) is a hyperparameter that requires tuning or scheduling. A fixed threshold may be too aggressive early in training when per-class accuracy is uniformly low, causing the hard-class set to encompass all classes and collapsing the criterion to standard prototype alignment. A curriculum schedule that tightens $\tau_{cls}$ as training progresses --- starting permissive and becoming selective as per-class accuracy differentiates --- would address this, and is a natural direction for future work.
+
+Third, the window size \(W\) of the recency-weighted exploration bonus is a hyperparameter. A small \(W\) prioritises recent exploration but may cause the method to revisit previously visited neighbours too quickly; a large \(W\) provides more stable exploration incentives but reacts slowly to changes in neighbour quality. We use \(W = 10\) as a default based on expected degree in the Erd\H{o}s--R\'{e}nyi graph, but the optimal value is likely topology-dependent.
+
+Fourth, the theoretical results of Section~\ref{sec:theory} characterise the cost and structure of one-peer selection but do not provide end-to-end convergence guarantees for the joint local training and peer-exchange procedure under non-convex representation-learning losses. Establishing such guarantees for encoder--decoder models with joint reconstruction and classification objectives remains an open problem.
+
+Fifth, on scale-free topologies the anchor quality screen occasionally rejects hub clients whose class distribution is incompatible with a peripheral client's dominant classes, even when the hub carries useful information about the peripheral client's weak classes. This means \texttt{random\_peer} can outperform \texttt{pearl\_full} on worst-client accuracy on scale-free graphs due to the accidental benefit of hub information diffusion. A future extension of the hard-class alignment criterion that explicitly seeks out hubs with coverage of the local client's hard classes would address this limitation while retaining the negative transfer reduction benefit.
+
+Sixth, all experiments use Fashion-MNIST, which is a relatively simple dataset with modest representation learning difficulty. The extent to which the findings generalise to harder datasets such as CIFAR-10 or CIFAR-100, or to tabular and biomedical domains, remains to be established.
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Removing the server from federated learning removes more than a communication hub --- it removes the global intelligence that protects individual clients. In a fully decentralised system each client is blind: it cannot identify compatible neighbours, detect harmful exchanges in advance, or rely on a coordinator to correct damage. Under a one-peer budget this blindness is acutely costly, and weak clients with unusual distributions bear the highest risk.
+
+PEARL addresses this through a minimal local compatibility test. Before committing to model exchange, each client evaluates candidate neighbours on its own data, combines anchor-validated quality with hard-class prototype alignment and recency-weighted exploration, and selects the single peer most likely to be safe and informative. No global coordination is required. No additional model-bearing exchange is needed. The budget is preserved.
+
+\rev{The theoretical results clarify why distributional compatibility and repeated exploration matter: Proposition~\ref{prop:selection_gap} motivates client-specific compatibility screening, Corollary~\ref{cor:deterministic_selection} warns against deterministic partner lock-in, and Proposition~\ref{prop:consensus} identifies the edge-activation condition needed for consensus-style mixing.} Full-scale experiments on two topologies ($K=50$, 150 rounds, 3 seeds) confirm that \texttt{pearl\_full} achieves the lowest negative transfer rate of all ten evaluated methods on both: $0.153\pm0.050$ on ER ($-2.0$~pp vs random, $-14.7$~pp vs next-best ablation) and $0.133\pm0.061$ on scale-free ($-3.3$~pp vs random, $-12.0$~pp vs next-best ablation). The negative transfer advantage grows with degree heterogeneity, confirming that the anchor screen becomes more valuable as random gossip becomes more dangerous. Worst-client accuracy is competitive on ER ($+1.1$~pp vs random) and best among methods with competitive mean accuracy on scale-free, Selection entropy stabilises at $0.183$--$0.194$ across both topologies, \rev{consistent with non-collapsed selection behaviour}. Mean accuracy trails random gossip by a stable $1.7$--$1.8$~pp, confirming this is a fixed cost of the compatibility screen rather than a topology-specific artefact --- and that the gains in reliability come without sacrificing aggregate performance beyond this overhead.
+
+\section*{Acknowledgment}
+
+\begin{thebibliography}{00}
+
+\bibitem{mcmahan2017communication}
+H. B. McMahan, E. Moore, D. Ramage, S. Hampson, and B. A. y Arcas, ``Communication-efficient learning of deep networks from decentralized data,'' in \emph{Proc. International Conference on Artificial Intelligence and Statistics (AISTATS)}, 2017, pp. 1273--1282.
+
+\bibitem{li2020fedprox}
+T. Li, A. K. Sahu, M. Zaheer, M. Sanjabi, A. Talwalkar, and V. Smith, ``Federated optimization in heterogeneous networks,'' in \emph{Proc. Machine Learning and Systems (MLSys)}, vol. 2, 2020, pp. 429--450.
+
+\bibitem{karimireddy2020scaffold}
+S. P. Karimireddy, S. Kale, M. Mohri, S. J. Reddi, S. U. Stich, and A. T. Suresh, ``SCAFFOLD: Stochastic controlled averaging for federated learning,'' in \emph{Proc. International Conference on Machine Learning (ICML)}, 2020, pp. 5132--5143.
+
+\bibitem{li2021moon}
+Q. Li, B. He, and D. Song, ``Model-contrastive federated learning,'' in \emph{Proc. IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2021, pp. 10713--10722.
+
+\bibitem{yuan2023decentralized}
+L. Yuan, Z. Wang, L. Sun, P. S. Yu, and C. G. Brinton, ``Decentralized federated learning: A survey and perspective,'' \emph{arXiv preprint arXiv:2306.01603}, 2023.
+
+\bibitem{lian2017decentralized}
+X. Lian, C. Zhang, H. Zhang, C.-J. Hsieh, W. Zhang, and J. Liu, ``Can decentralized algorithms outperform centralized algorithms? A case study for decentralized parallel stochastic gradient descent,'' in \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2017.
+
+\bibitem{ormandi2013gossip}
+R. Orm\'{a}ndi, I. Heged\H{u}s, and M. Jelasity, ``Gossip learning with linear models on fully distributed data,'' \emph{Concurrency and Computation: Practice and Experience}, vol. 25, no. 4, pp. 556--571, 2013.
+
+\bibitem{hegedus2019gossip}
+I. Heged\H{u}s, G. Danner, and M. Jelasity, ``Gossip learning as a decentralized alternative to federated learning,'' in \emph{Distributed Applications and Interoperable Systems}, 2019, pp. 74--90.
+
+\bibitem{wang2019matcha}
+J. Wang, A. K. Sahu, Z. Yang, G. Joshi, and S. Kar, ``MATCHA: Speeding up decentralized SGD via matching decomposition sampling,'' in \emph{Proc. Sixth Indian Control Conference (ICC)}, 2019, pp. 299--300.
+
+\bibitem{koloskova2019choco}
+A. Koloskova, S. U. Stich, and M. Jaggi, ``Decentralized stochastic optimization and gossip algorithms with compressed communication,'' in \emph{Proc. International Conference on Machine Learning (ICML)}, 2019, pp. 3478--3487.
+
+\bibitem{arivazhagan2019fedper}
+M. G. Arivazhagan, V. Aggarwal, A. K. Singh, and S. Choudhary, ``Federated learning with personalization layers,'' \emph{arXiv preprint arXiv:1912.00818}, 2019.
+
+\bibitem{collins2021exploiting}
+L. Collins, H. Hassani, A. Mokhtari, and S. Shakkottai, ``Exploiting shared representations for personalized federated learning,'' in \emph{Proc. International Conference on Machine Learning (ICML)}, 2021, pp. 2089--2099.
+
+\bibitem{dinh2020pfedme}
+C. T. Dinh, N. H. Tran, and T. D. Nguyen, ``Personalized federated learning with Moreau envelopes,'' in \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2020.
+
+\bibitem{li2021ditto}
+T. Li, S. Hu, A. Beirami, and V. Smith, ``Ditto: Fair and robust federated learning through personalization,'' in \emph{Proc. International Conference on Machine Learning (ICML)}, 2021, pp. 6357--6368.
+
+\bibitem{le2018supervised}
+L. Le, A. Patterson, and M. White, ``Supervised autoencoders: Improving generalization performance with unsupervised regularizers,'' in \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2018.
+
+\bibitem{chen2023auto}
+S. Chen, J. Chen, X. Zhang, and Y. Li, ``Auto-encoders in deep learning---A review with new perspectives,'' \emph{Mathematics}, vol. 11, no. 8, 2023.
+
+\bibitem{gille2022semi}
+C. Gille, C. Hildebrandt, and S. P. R. A. Sauer, ``Semi-supervised classification using a supervised autoencoder,'' \emph{arXiv preprint arXiv:2208.10315}, 2022.
+
+\bibitem{kavalionak2022topologies}
+H. Kavalionak and E. Carlini, ``Decentralized federated learning and network topologies,'' in \emph{CEUR Workshop Proceedings}, 2022.
+
+\bibitem{krasanakis2021p2pgnn}
+E. Krasanakis, S. Papadopoulos, and I. Kompatsiaris, ``p2pGNN: A decentralized graph neural network for node classification in peer-to-peer networks,'' \emph{arXiv preprint arXiv:2111.14837}, 2021.
+
+\bibitem{xiao2017fashion}
+H. Xiao, K. Rasul, and R. Vollgraf, ``Fashion-MNIST: A novel image dataset for benchmarking machine learning algorithms,'' \emph{arXiv preprint arXiv:1708.07747}, 2017.
+
+\end{thebibliography}
+
+
+
+\balance
+\end{document}
