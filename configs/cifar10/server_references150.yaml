@@ -1,0 +1,54 @@
+experiment_name: cifar10_server_references150
+output_dir: results/cifar10/server/references_alpha03
+
+seeds: [1, 2, 3]
+methods:
+  - fedavg
+  - fedprox
+  - fedper
+  - fedrep
+  - ditto
+
+seed: 1
+dataset: cifar10
+data_dir: data
+download: true
+num_clients: 50
+partition: dirichlet
+dirichlet_alpha: 0.3
+classes_per_client: 2
+min_client_size: 10
+train_subset: null
+test_subset: null
+
+graph_type: server
+er_prob: 0.15
+
+rounds: 150
+local_epochs: 1
+batch_size: 64
+lr: 1.0e-3
+num_workers: 2
+pin_memory: true
+device: auto
+
+latent_dim: 128
+model_width: 32
+lambda_rec: 1.0
+lambda_cls: 1.0
+mixing_alpha: 0.3
+exchange_mode: encoder_decoder_local_head
+selection_method: fedavg
+fedprox_mu: 0.01
+fedrep_head_epochs: 1
+fedrep_rep_epochs: 1
+ditto_lambda: 0.1
+ditto_personal_epochs: 1
+
+anchor_size: 64
+hard_class_threshold: 0.5
+explore_window: 10
+active_probability: 1.0
+descriptor_refresh_period: 1
+eval_every: 5
+plot_format: pdf

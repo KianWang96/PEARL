@@ -42,6 +42,18 @@ def prototype_distance_hard(
     return dist / len(use)
 
 
+def classifier_distance(
+    model_k: torch.nn.Module,
+    model_j: torch.nn.Module,
+) -> float:
+    """Squared distance between final classifier layers."""
+    params_k = list(model_k.classifier[-1].parameters())
+    params_j = list(model_j.classifier[-1].parameters())
+    return float(
+        sum(torch.sum((left - right) ** 2).item() for left, right in zip(params_k, params_j))
+    )
+
+
 def select_peer(
     k: int,
     neighbors: dict[int, list[int]],
@@ -63,13 +75,20 @@ def select_peer(
     if method == "local_only":
         return None
 
-    if method == "random_peer":
+    if method in {"random_peer", "dpsgd_one_peer"}:
         return random.choice(neigh)
 
     if method == "static_peer":
         if k not in static_peer_cache:
             static_peer_cache[k] = random.choice(neigh)
-        return static_peer_cache[k]
+        peer = static_peer_cache[k]
+        return peer if peer in neigh else None
+
+    if method == "model_similarity":
+        return min(
+            neigh,
+            key=lambda j: classifier_distance(models_snapshot[k], models_snapshot[j]),
+        )
 
     hard_classes = get_hard_classes(
         descriptors[k]["class_acc"],

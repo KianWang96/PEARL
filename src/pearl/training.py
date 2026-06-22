@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Callable
+
 import numpy as np
 import pandas as pd
 import torch
@@ -16,25 +19,52 @@ def local_train(
     loader,
     config: ExperimentConfig,
     device: torch.device,
+    proximal_reference: dict[str, torch.Tensor] | None = None,
+    proximal_mu: float = 0.0,
+    trainable_filter: Callable[[str], bool] | None = None,
+    local_epochs: int | None = None,
 ) -> float:
     model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    original_requires_grad = {
+        name: parameter.requires_grad
+        for name, parameter in model.named_parameters()
+    }
+    if trainable_filter is not None:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = trainable_filter(name)
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("No trainable parameters selected for local training.")
+    optimizer = torch.optim.Adam(trainable_parameters, lr=config.lr)
     total_loss = 0.0
     n = 0
 
-    for _ in range(config.local_epochs):
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            x_hat, logits, _ = model(x)
-            loss = (
-                config.lambda_rec * F.mse_loss(x_hat, x)
-                + config.lambda_cls * F.cross_entropy(logits, y)
-            )
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * x.size(0)
-            n += x.size(0)
+    try:
+        for _ in range(local_epochs or config.local_epochs):
+            for x, y in loader:
+                x, y = x.to(device), y.to(device)
+                optimizer.zero_grad()
+                x_hat, logits, _ = model(x)
+                loss = (
+                    config.lambda_rec * F.mse_loss(x_hat, x)
+                    + config.lambda_cls * F.cross_entropy(logits, y)
+                )
+                if proximal_reference is not None and proximal_mu > 0.0:
+                    proximal = sum(
+                        torch.sum((parameter - proximal_reference[name]) ** 2)
+                        for name, parameter in model.named_parameters()
+                        if parameter.requires_grad
+                    )
+                    loss = loss + 0.5 * proximal_mu * proximal
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item() * x.size(0)
+                n += x.size(0)
+    finally:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = original_requires_grad[name]
 
     return total_loss / max(1, n)
 
@@ -66,10 +96,18 @@ def evaluate_model(model: torch.nn.Module, loader, device: torch.device) -> dict
             "cls_loss": 0.0,
         }
 
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="y_pred contains classes not in y_true",
+            category=UserWarning,
+        )
+        balanced_accuracy = balanced_accuracy_score(ys, preds)
+
     return {
         "accuracy": float(accuracy_score(ys, preds)),
         "macro_f1": float(f1_score(ys, preds, average="macro", zero_division=0)),
-        "balanced_accuracy": float(balanced_accuracy_score(ys, preds)),
+        "balanced_accuracy": float(balanced_accuracy),
         "rec_mse": float(sum(rec_losses) / max(1, n)),
         "cls_loss": float(sum(cls_losses) / max(1, n)),
     }

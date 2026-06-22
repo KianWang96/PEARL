@@ -50,12 +50,25 @@ def get_dataset(
             download=download,
             transform=transform,
         )
+    elif name == "cifar10":
+        train_ds = torchvision.datasets.CIFAR10(
+            root=root,
+            train=True,
+            download=download,
+            transform=transform,
+        )
+        test_ds = torchvision.datasets.CIFAR10(
+            root=root,
+            train=False,
+            download=download,
+            transform=transform,
+        )
     else:
         raise ValueError(f"Unknown dataset: {name}")
 
     num_classes = 10
-    in_channels = 1
-    img_size = 28
+    in_channels = 3 if name == "cifar10" else 1
+    img_size = 32 if name == "cifar10" else 28
 
     if train_subset is not None:
         train_ds = Subset(train_ds, list(range(min(train_subset, len(train_ds)))))
@@ -184,11 +197,16 @@ def make_client_loaders(
     ]
 
 
-def make_test_loader(test_ds, batch_size: int = 256, num_workers: int = 2) -> DataLoader:
+def make_test_loader(
+    test_ds,
+    batch_size: int = 256,
+    num_workers: int = 2,
+    pin_memory: bool | None = None,
+) -> DataLoader:
     return DataLoader(
         test_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=torch.cuda.is_available() if pin_memory is None else pin_memory,
     )

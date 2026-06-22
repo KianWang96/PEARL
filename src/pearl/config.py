@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from pearl.constants import DEFAULT_METHODS
+from pearl.constants import DEFAULT_METHODS, SERVER_METHODS, SUPPORTED_METHODS
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,7 @@ class ExperimentConfig:
     device: str = "auto"
 
     latent_dim: int = 64
+    model_width: int = 16
     lambda_rec: float = 1.0
     lambda_cls: float = 1.0
 
@@ -57,6 +58,13 @@ class ExperimentConfig:
     anchor_size: int = 64
     hard_class_threshold: float = 0.5
     explore_window: int = 10
+    fedprox_mu: float = 0.01
+    fedrep_head_epochs: int = 1
+    fedrep_rep_epochs: int = 1
+    ditto_lambda: float = 0.1
+    ditto_personal_epochs: int = 1
+    active_probability: float = 1.0
+    descriptor_refresh_period: int = 1
     eval_every: int = 1
     plot_format: str = "pdf"
 
@@ -84,7 +92,7 @@ def config_from_mapping(data: dict[str, Any]) -> ExperimentConfig:
     coerced = {}
     for key, value in data.items():
         coerced[key] = _coerce_like_default(value, defaults[key])
-    return ExperimentConfig(**{**defaults, **coerced})
+    return _validate_config(ExperimentConfig(**{**defaults, **coerced}))
 
 
 def apply_overrides(
@@ -105,15 +113,42 @@ def apply_overrides(
             raise KeyError(f"Unknown override key: {key}")
         parsed = _parse_override_value(raw_value)
         data[key] = _coerce_like_default(parsed, data[key])
-    return ExperimentConfig(**data)
+    return _validate_config(ExperimentConfig(**data))
+
+
+def _validate_config(config: ExperimentConfig) -> ExperimentConfig:
+    if config.dataset not in {"fashion_mnist", "mnist", "cifar10"}:
+        raise ValueError(f"Unknown dataset: {config.dataset}")
+    if not 0.0 < config.active_probability <= 1.0:
+        raise ValueError("active_probability must be in (0, 1].")
+    if config.descriptor_refresh_period < 1:
+        raise ValueError("descriptor_refresh_period must be at least 1.")
+    if config.model_width < 1:
+        raise ValueError("model_width must be at least 1.")
+    if config.fedprox_mu < 0.0:
+        raise ValueError("fedprox_mu must be nonnegative.")
+    if config.fedrep_head_epochs < 1 or config.fedrep_rep_epochs < 1:
+        raise ValueError("FedRep phase epochs must be at least 1.")
+    if config.ditto_lambda < 0.0 or config.ditto_personal_epochs < 1:
+        raise ValueError("Ditto lambda must be nonnegative and epochs at least 1.")
+    unknown_methods = sorted(set(config.methods) - SUPPORTED_METHODS)
+    if unknown_methods:
+        raise ValueError(f"Unknown method(s): {', '.join(unknown_methods)}")
+    if config.selection_method not in SUPPORTED_METHODS:
+        raise ValueError(f"Unknown selection_method: {config.selection_method}")
+    if config.graph_type == "server" and not set(config.methods) <= SERVER_METHODS:
+        raise ValueError("graph_type=server may only contain server reference methods.")
+    return config
 
 
 def save_config(config: ExperimentConfig, path: str | Path) -> None:
     """Save the fully resolved config next to experiment outputs."""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
+    temp_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+    with temp_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(asdict(config), f, sort_keys=False)
+    temp_path.replace(output_path)
 
 
 def _parse_override_value(raw_value: str) -> Any:
