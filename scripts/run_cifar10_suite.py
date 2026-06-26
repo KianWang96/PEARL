@@ -118,6 +118,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate configs and print ordered commands without side effects.",
     )
+    parser.add_argument(
+        "--cluster",
+        action="store_true",
+        help="Schedule all selected configs through the single-node GPU cluster runner.",
+    )
+    parser.add_argument(
+        "--gpus",
+        default="auto",
+        help="Cluster GPU slots: auto, cpu, or a comma-separated list such as 0,1,2,3.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Cap cluster worker processes. Defaults to one worker per GPU slot.",
+    )
     return parser
 
 
@@ -125,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configs = _configs_for_suite(args.suite)
     loaded_configs = _validate_config_matrix(configs)
+    if args.cluster:
+        return _run_cluster_suite(args, configs, loaded_configs)
+
     commands = [_command_for_config(config, args) for config in configs]
 
     if args.dry_run:
@@ -265,6 +284,58 @@ def _run_preflight(args, reporter: Reporter, run_dir: Path) -> None:
                 f"All-method smoke matrix failed with exit code {return_code}."
             )
         reporter.log("Preflight: all-method smoke matrix passed.")
+
+
+def _run_cluster_suite(
+    args,
+    configs: list[str],
+    loaded_configs: list[ExperimentConfig],
+) -> int:
+    run_dir = _resolve_run_dir(args.run_dir)
+    if args.dry_run:
+        return _invoke_cluster_runner(args, configs, run_dir)
+
+    reporter = Reporter(run_dir / "suite_preflight.log")
+    try:
+        _print_header(reporter, args, configs, loaded_configs, run_dir)
+        reporter.log("Cluster mode: running suite preflight before scheduling tasks.")
+        _run_preflight(args, reporter, run_dir)
+        if args.preflight_only:
+            reporter.log("Preflight completed successfully; cluster tasks were not started.")
+            return 0
+    finally:
+        reporter.close()
+
+    return _invoke_cluster_runner(args, configs, run_dir)
+
+
+def _invoke_cluster_runner(args, configs: list[str], run_dir: Path) -> int:
+    from pearl.cli.cluster_run import main as cluster_main
+
+    cluster_args: list[str] = []
+    for config in configs:
+        cluster_args.extend(["--config", str(ROOT / config)])
+    cluster_args.extend(["--gpus", args.gpus, "--run-dir", str(run_dir)])
+    if args.max_workers is not None:
+        cluster_args.extend(["--max-workers", str(args.max_workers)])
+    cluster_args.append("--resume" if args.resume else "--no-resume")
+    if args.skip_plots:
+        cluster_args.append("--skip-plots")
+    if args.quiet:
+        cluster_args.append("--quiet")
+    if args.continue_on_error:
+        cluster_args.append("--continue-on-error")
+    if args.dry_run:
+        cluster_args.append("--dry-run")
+    if args.skip_dataset_check:
+        cluster_args.append("--skip-dataset-preflight")
+
+    previous_cwd = Path.cwd()
+    os.chdir(ROOT)
+    try:
+        return cluster_main(cluster_args)
+    finally:
+        os.chdir(previous_cwd)
 
 
 def _prepare_cifar10(reporter: Reporter):

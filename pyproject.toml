@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 pearl-run = "pearl.cli.run:main"
+pearl-cluster-run = "pearl.cli.cluster_run:main"
 pearl-plot = "pearl.cli.plot:main"
 pearl-summarize = "pearl.cli.summarize:main"
 

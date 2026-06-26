@@ -101,6 +101,20 @@ Run every selected CIFAR-10 config in order:
 python scripts/run_cifar10_suite.py --suite all
 ```
 
+On a single 8-GPU node, schedule independent method/seed runs across all
+visible GPUs:
+
+```bash
+python scripts/run_cluster.py --config configs/cifar10/pearl_er150.yaml --gpus auto
+python scripts/run_cifar10_suite.py --suite all --cluster --gpus 0,1,2,3,4,5,6,7
+```
+
+Cluster mode is opt-in and keeps the normal single-card runner unchanged. It
+sets `CUDA_VISIBLE_DEVICES` per worker, resumes complete per-run CSVs by
+default, writes task logs/status under `_cluster_runs` or the suite run
+directory, and combines summaries/plots after all tasks for an output directory
+finish.
+
 Resume is enabled by default. Use `--dry-run` to inspect the commands,
 `--no-resume` to force reruns, and `--continue-on-error` to continue after a
 failed config. The console reports suite, config, method/seed, and round
